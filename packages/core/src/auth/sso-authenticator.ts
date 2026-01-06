@@ -8,6 +8,7 @@
 import * as http from 'node:http';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
+import * as readline from 'node:readline';
 import { URL, URLSearchParams } from 'node:url';
 import open from 'open';
 
@@ -286,22 +287,33 @@ export class SSOAuthenticator {
   }
 
   /**
-   * Read user input from stdin.
+   * Read user input from stdin using readline.
+   * This properly handles raw mode by temporarily switching to line mode.
    */
   private readUserInput(): Promise<string> {
     return new Promise((resolve) => {
-      let input = '';
+      // Save current raw mode state and switch to line mode for readline
+      const wasRaw = process.stdin.isRaw;
+      if (wasRaw) {
+        process.stdin.setRawMode(false);
+      }
 
-      process.stdin.setEncoding('utf8');
-      process.stdin.once('data', (data) => {
-        input = data.toString().trim();
-        resolve(input);
+      const rl = readline.createInterface({
+        input: process.stdin,
+        output: process.stdout,
+        terminal: true,
       });
 
-      // For non-interactive mode, resolve after a short timeout
-      setTimeout(() => {
-        if (!input) resolve('');
-      }, 100);
+      rl.question('> ', (answer) => {
+        rl.close();
+
+        // Restore raw mode if it was enabled
+        if (wasRaw && process.stdin.isTTY) {
+          process.stdin.setRawMode(true);
+        }
+
+        resolve(answer.trim());
+      });
     });
   }
 }

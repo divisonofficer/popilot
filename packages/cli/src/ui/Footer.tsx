@@ -11,10 +11,15 @@ const POSTECH_YELLOW = '#ffb300';
 export interface FooterProps {
   state: 'idle' | 'streaming' | 'confirming' | 'authenticating';
   model: string;
+  isAuthenticated?: boolean;
+  initializingChat?: boolean;
 }
 
-export function Footer({ state, model }: FooterProps) {
+export function Footer({ state, model, isAuthenticated = true, initializingChat = false }: FooterProps) {
   const getStatusText = () => {
+    if (initializingChat) {
+      return '채팅방 초기화 중...';
+    }
     switch (state) {
       case 'streaming':
         return '응답 생성 중... (Ctrl+C: 취소)';
@@ -23,17 +28,34 @@ export function Footer({ state, model }: FooterProps) {
       case 'authenticating':
         return '인증 중...';
       default:
-        return 'Ready';
+        return isAuthenticated ? 'Ready' : 'Login Required';
     }
+  };
+
+  const getStatusColor = () => {
+    if (initializingChat || state !== 'idle') return POSTECH_YELLOW;
+    return isAuthenticated ? 'green' : 'red';
+  };
+
+  // Get short model name for display
+  const getShortModelName = () => {
+    const modelMap: Record<string, string> = {
+      'claude-sonnet-4-5': 'Claude',
+      'gpt-5.1': 'GPT',
+      'gemini-3-pro': 'Gemini',
+    };
+    return modelMap[model] || model;
   };
 
   return (
     <Box marginTop={1} justifyContent="space-between">
       <Box>
         <Text color="gray">Status: </Text>
-        <Text color={state === 'idle' ? 'green' : POSTECH_YELLOW}>
+        <Text color={getStatusColor()}>
           {getStatusText()}
         </Text>
+        <Text color="gray"> | Model: </Text>
+        <Text color={POSTECH_YELLOW}>{getShortModelName()}</Text>
       </Box>
       <Box>
         <Text color="gray">

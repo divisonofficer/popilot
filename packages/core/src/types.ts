@@ -32,6 +32,31 @@ export const AVAILABLE_MODELS: Record<string, ModelConfig> = {
   },
 };
 
+/**
+ * Model shortcut aliases for easier command input.
+ */
+export const MODEL_ALIASES: Record<string, string> = {
+  'claude': 'claude-sonnet-4-5',
+  'gpt': 'gpt-5.1',
+  'gemini': 'gemini-3-pro',
+};
+
+/**
+ * Resolve model name from input (supports aliases).
+ */
+export function resolveModelName(input: string): string | undefined {
+  // Direct match
+  if (AVAILABLE_MODELS[input]) {
+    return input;
+  }
+  // Alias match
+  const alias = MODEL_ALIASES[input.toLowerCase()];
+  if (alias && AVAILABLE_MODELS[alias]) {
+    return alias;
+  }
+  return undefined;
+}
+
 // ============================================
 // Message Types
 // ============================================
@@ -55,18 +80,29 @@ export interface ContentPart {
 // API Request/Response Types
 // ============================================
 
+/**
+ * Model config in API format (snake_case).
+ */
+export interface PostechModelConfig {
+  provider: ModelProvider;
+  model_name: string;
+  deployment_name: string;
+}
+
 export interface PostechRequestPayload {
   app_type: 'browser';
   device_type: 'pc';
   users_id: number;
   chat_rooms_id: number;
   llms: {
-    model_config: ModelConfig;
+    model_config: PostechModelConfig;
   };
   param_filters: {
     dept_code: string[];
     sclpst_code: string[];
     email_1: string[];
+    user_id?: string[];
+    nm?: string[];
   };
   queries: {
     type: 'text';
@@ -106,6 +142,8 @@ export interface UserInfo {
   email: string;
   deptCode: string;
   sclpstCode: string;
+  userName?: string;  // user_id in param_filters
+  name?: string;      // nm in param_filters
 }
 
 // ============================================
@@ -188,7 +226,7 @@ export interface PopilotConfig {
 }
 
 export const DEFAULT_CONFIG: PopilotConfig = {
-  apiUrl: 'https://galaxy.postech.ac.kr/api/v1/chat',
+  apiUrl: 'https://genai.postech.ac.kr/v2/athena/chats/m1/queries',
   ssoUrl: 'https://genai.postech.ac.kr/auth/login',
   callbackPattern: 'genai.postech.ac.kr/auth/callback',
   defaultModel: 'claude-sonnet-4-5',

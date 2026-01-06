@@ -10,6 +10,8 @@ export {
   PostechClient,
   PostechClientError,
   type PostechClientConfig,
+  type AIAgent,
+  type ChatRoomInfo,
 } from './client/postech-client.js';
 export { RequestTransformer } from './client/request-transformer.js';
 
