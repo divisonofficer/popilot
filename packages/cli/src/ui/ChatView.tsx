@@ -29,7 +29,7 @@ function MessageBubble({ message }: { message: Message }) {
       borderColor={isUser ? 'blue' : 'green'}
     >
       <Text color={isUser ? 'blue' : 'green'} bold>
-        {isUser ? '👤 You' : '🤖 Popilot'}
+        {isUser ? '👤 You' : '🐦 Popilot'}
       </Text>
       <Box marginTop={1}>
         <Text wrap="wrap">{content}</Text>
@@ -56,7 +56,7 @@ export function ChatView({ messages, currentResponse, isStreaming }: ChatViewPro
           <Box>
             {isStreaming && <Spinner type="dots" />}
             <Text color="yellow" bold>
-              {' '}🤖 Popilot {isStreaming ? '(typing...)' : ''}
+              {' '}🐦 Popilot {isStreaming ? '(typing...)' : ''}
             </Text>
           </Box>
           {currentResponse && (

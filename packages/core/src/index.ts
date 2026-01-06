@@ -13,7 +13,7 @@ export {
   type AIAgent,
   type ChatRoomInfo,
 } from './client/postech-client.js';
-export { RequestTransformer } from './client/request-transformer.js';
+export { RequestTransformer, type TransformerConfig } from './client/request-transformer.js';
 
 // Authentication
 export {
@@ -38,3 +38,6 @@ export { ToolParser, type ParsedToolBlock } from './tools/tool-parser.js';
 
 // Services
 export { SessionService, type SessionServiceConfig } from './services/session-service.js';
+
+// Utils
+export { DebugLogger } from './utils/logger.js';

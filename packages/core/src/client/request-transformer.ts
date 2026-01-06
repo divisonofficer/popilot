@@ -7,114 +7,195 @@
 
 import type { Message, ContentPart } from '../types.js';
 
-// Configuration constants
-const HARD_LIMIT = 4400;
-const MAX_TEXT_LENGTH = 60000;
-const MAX_TOOL_OUTPUT_LENGTH = 800;
-const KEEP_RECENT_MESSAGES = 6;
+// Default configuration constants
+const DEFAULT_HARD_LIMIT = 4400;
+const DEFAULT_MAX_TEXT_LENGTH = 60000;
+const DEFAULT_MAX_TOOL_OUTPUT_LENGTH = 4000;  // Increased from 800 to prevent re-reading files
+const DEFAULT_KEEP_RECENT_MESSAGES = 6;
 
-// Response constraint prompt
-const RESPONSE_CONSTRAINT = `⚠️ CRITICAL OUTPUT LENGTH LIMIT ⚠️
-Hard limit: MAX ${HARD_LIMIT} characters (not tokens).
+/**
+ * Configuration options for RequestTransformer.
+ */
+export interface TransformerConfig {
+  /** Maximum characters for AI response (default: 4400) */
+  hardLimit?: number;
+  /** Maximum total text length for request (default: 60000) */
+  maxTextLength?: number;
+  /** Maximum characters for tool output (default: 800) */
+  maxToolOutputLength?: number;
+  /** Number of recent messages to keep in full (default: 6) */
+  keepRecentMessages?: number;
+  /** Model provider for provider-specific prompts (default: 'anthropic') */
+  modelProvider?: 'anthropic' | 'azure' | 'google';
+}
 
-Character counting rules (MUST follow):
-- Count characters exactly as they would appear if the whole output is copied into a plain text file.
-- Newlines and tabs count as characters too.
-- Also count all spaces, punctuation, quotes, backslashes, and any markup characters.
+/**
+ * Generate response constraint prompt based on config.
+ */
+function generateResponseConstraint(hardLimit: number): string {
+  return `Keep response under ${hardLimit} characters. Be concise.`;
+}
 
-Output format (MUST follow):
-1) First line: CHAR_COUNT=<integer>
-2) The answer body
-
-If the answer might exceed 2500 characters:
-- Switch immediately to COMPRESSED MODE:
-  - Max 10 bullet points
-  - 1–2 sentences per bullet
-  - No long code blocks (at most 20 lines, or summarize in prose)
-  - Remove non-essential explanations and examples
-
-Self-check requirement:
-- Before sending, verify the final output length ≤ 3500 characters.
-- If unsure, shorten further until clearly under the limit.`;
-
-// MCP Tool System Prompt
-const MCP_TOOL_PROMPT = `
-=== 파일 수정 도구 (MUST USE) ===
-
-중요: 파일 수정 요청 시 반드시 아래 도구를 실행하세요. 설명만 하지 말고 실제로 실행!
-
-■ 필수 워크플로우:
-1. run_terminal_command로 파일 찾기
-2. file.read로 파일 읽기 + SHA256 획득
-3. file.applyTextEdits로 실제 수정 (반드시 실행!)
-
-■ 도구 형식:
-[CODE]tool
-TOOL_NAME: 도구이름
-BEGIN_ARG: 인자명
-값
-END_ARG
-[CODE]
-
-■ run_terminal_command (파일 검색):
-[CODE]tool
-TOOL_NAME: run_terminal_command
-BEGIN_ARG: command
-find . -name "*.svelte" | head -20
-END_ARG
-[CODE]
-
-■ file.read (파일 읽기):
-[CODE]tool
-TOOL_NAME: file.read
-BEGIN_ARG: filepath
-src/lib/components/Example.svelte
-END_ARG
-[CODE]
-
-■ file.applyTextEdits (파일 수정 - 핵심!):
-[CODE]tool
-TOOL_NAME: file.applyTextEdits
-BEGIN_ARG: filepath
-src/lib/components/Example.svelte
-END_ARG
-BEGIN_ARG: expectedSha256
-abc123def456...
-END_ARG
-BEGIN_ARG: edits
-[{"startLine": 10, "endLine": 12, "newText": "새로운 코드\\n"}]
-END_ARG
-[CODE]
-
-■ 규칙:
-- expectedSha256: file.read 결과에서 복사
-- startLine/endLine: 1부터 시작
-- 파일 수정 요청 → file.applyTextEdits 반드시 실행
-- 설명만 하지 말고 도구를 실제로 호출할 것!
+// GPT-specific tool reminder (GPT tends to ignore tool system)
+const GPT_TOOL_REMINDER = `
+[CRITICAL] You have REAL tools connected to this system. When I ask to modify files, you MUST use the [CODE]tool format below.
+Do NOT say "I cannot execute tools" - you CAN and MUST use them!
 `;
 
-const USER_WRAPPER_PREFIX = `[${HARD_LIMIT}자 이하, \\n 포함 raw 문자수로 계산, CHAR_COUNT= 필수]`;
-const USER_WRAPPER_SUFFIX = `[RAW END - 불필요한 요약 금지]
-    When you include code, prefer:
-- High-level pseudocode or short fragments only.
-- Avoid indentation-heavy output.
-- Avoid large JSON / long XML / generated files.
-    `;
+// MCP Tool System Prompt - All available tools for file operations
+const MCP_TOOL_PROMPT = `
+=== Popilot Tool System ===
+
+[!!!] REQUIRED BEHAVIOR [!!!]
+You are a coding agent that directly modifies code. Do NOT explain - EXECUTE!
+
+1. File modification request -> MUST use tools (NO explanations!)
+2. Markdown code blocks FORBIDDEN! -> Use [CODE]tool format only
+3. Here is how to do it FORBIDDEN! -> Directly call tools to modify
+4. Unknown file location -> Use tree/list_directory to find
+
+[!] Explanation-only responses are considered FAILURE!
+
+# Tool call format:
+[CODE]tool
+TOOL_NAME: toolname
+BEGIN_ARG: argname
+value
+END_ARG
+[CODE]
+
+# Available tools:
+
+1. list_directory - List directory contents
+   Args: dirpath (optional, default: workspace root)
+
+2. read_file - Read file (simple)
+   Args: filepath (required)
+
+3. file.read - Read file + SHA256 (required before modification)
+   Args: filepath (required), startLine (optional), endLine (optional)
+   [!] For large files, use startLine/endLine to read only 100-200 lines!
+
+4. file.search - Search pattern in file
+   Args: filepath (required), pattern (required, regex)
+
+5. create_new_file - Create new file
+   Args: filepath (required), content (required)
+
+6. edit_file - Overwrite entire file
+   Args: filepath (required), content (required)
+
+7. file.applyTextEdits - Partial edit (atomic, recommended)
+   Args: filepath (required), expectedSha256 (required), edits (required)
+   Workflow: file.read to get sha256 -> file.applyTextEdits to modify
+
+8. run_terminal_command - Execute terminal command
+   Args: command (required)
+
+9. tree - Show project structure tree (recursive)
+   Args: dirpath (optional), depth (optional, default: 3)
+
+# File modification workflow:
+1. tree to understand project structure
+2. file.search to find location (get line number)
+3. file.read with startLine/endLine to read only needed part
+4. file.applyTextEdits for partial modification
+
+# Rules:
+- MUST call tools for file operations
+- expectedSha256: copy from file.read result
+- startLine/endLine: 1-indexed
+- Do NOT explain - call tools!
+
+# [!!!] Tool call limit [!!!]
+- Max 2-3 tools per response!
+- Need more? Call in next response after getting results
+- Reason: Too many tool calls cause context overflow error
+
+# [!!!] FORBIDDEN behaviors [!!!]
+1. Please provide file path - FORBIDDEN! Use tree/list_directory
+2. Please upload file - FORBIDDEN! Use file.read
+3. Which file? - FORBIDDEN! Explore yourself
+4. Need more info - FORBIDDEN! Gather info with tools
+
+# [!!!] ABSOLUTE PROHIBITIONS [!!!]
+1. Do NOT write [Tool Result]: yourself - system provides it
+2. Do NOT fake results like Done or Successfully applied
+3. After file.read, MUST call file.applyTextEdits with [CODE]tool format
+4. Markdown code blocks do NOT modify files!
+`;
+
+function generateUserWrapperPrefix(hardLimit: number): string {
+  return `[User message - respond concisely]`;
+}
+const USER_WRAPPER_SUFFIX = ``;
 
 /**
  * Transforms messages to POSTECH API text format.
  */
 export class RequestTransformer {
+  private hardLimit: number;
+  private maxTextLength: number;
+  private maxToolOutputLength: number;
+  private keepRecentMessages: number;
+  private modelProvider: 'anthropic' | 'azure' | 'google';
+
+  constructor(config: TransformerConfig = {}) {
+    this.hardLimit = config.hardLimit ?? DEFAULT_HARD_LIMIT;
+    this.maxTextLength = config.maxTextLength ?? DEFAULT_MAX_TEXT_LENGTH;
+    this.maxToolOutputLength = config.maxToolOutputLength ?? DEFAULT_MAX_TOOL_OUTPUT_LENGTH;
+    this.keepRecentMessages = config.keepRecentMessages ?? DEFAULT_KEEP_RECENT_MESSAGES;
+    this.modelProvider = config.modelProvider ?? 'anthropic';
+  }
+
+  /**
+   * Get current configuration (for debugging).
+   */
+  getConfig(): TransformerConfig {
+    return {
+      hardLimit: this.hardLimit,
+      maxTextLength: this.maxTextLength,
+      maxToolOutputLength: this.maxToolOutputLength,
+      keepRecentMessages: this.keepRecentMessages,
+      modelProvider: this.modelProvider,
+    };
+  }
+
+  /**
+   * Update configuration at runtime.
+   */
+  updateConfig(config: Partial<TransformerConfig>): void {
+    if (config.hardLimit !== undefined) this.hardLimit = config.hardLimit;
+    if (config.maxTextLength !== undefined) this.maxTextLength = config.maxTextLength;
+    if (config.maxToolOutputLength !== undefined) this.maxToolOutputLength = config.maxToolOutputLength;
+    if (config.keepRecentMessages !== undefined) this.keepRecentMessages = config.keepRecentMessages;
+    if (config.modelProvider !== undefined) this.modelProvider = config.modelProvider;
+  }
+
   /**
    * Combine message history into a single prompt.
    * POSTECH API expects a single text query, so we combine all messages.
    */
   transform(messages: Message[]): string {
-    const parts: string[] = [RESPONSE_CONSTRAINT, MCP_TOOL_PROMPT];
+    const userWrapperPrefix = generateUserWrapperPrefix(this.hardLimit);
+    const parts: string[] = [];
+
+    // Only add response length constraint for Claude (anthropic) due to 5KB API limit
+    if (this.modelProvider === 'anthropic') {
+      const responseConstraint = generateResponseConstraint(this.hardLimit);
+      parts.push(responseConstraint);
+    }
+
+    // Add GPT-specific tool reminder (GPT tends to think it can't use tools)
+    if (this.modelProvider === 'azure' || this.modelProvider === 'google') {
+      parts.push(GPT_TOOL_REMINDER);
+    }
+
+    parts.push(MCP_TOOL_PROMPT);
 
     if (messages.length === 1) {
       const content = this.extractTextContent(messages[0].content);
-      parts.push(`${USER_WRAPPER_PREFIX}\n[User]: ${content}\n${USER_WRAPPER_SUFFIX}`);
+      parts.push(`${userWrapperPrefix}\n[User]: ${content}\n${USER_WRAPPER_SUFFIX}`);
       return this.truncateIfNeeded(this.sanitizeText(parts.join('\n\n')));
     }
 
@@ -128,7 +209,7 @@ export class RequestTransformer {
 
     // Determine which messages to keep fully (recent ones)
     const totalMsgs = messages.length;
-    const keepFromIdx = Math.max(0, totalMsgs - KEEP_RECENT_MESSAGES);
+    const keepFromIdx = Math.max(0, totalMsgs - this.keepRecentMessages);
 
     let skippedCount = 0;
 
@@ -136,6 +217,11 @@ export class RequestTransformer {
       const msg = messages[i];
       const content = this.extractTextContent(msg.content);
       if (!content) continue;
+
+      // Skip CLI system messages (not relevant to AI)
+      if (content.startsWith('[SYSTEM]')) {
+        continue;
+      }
 
       // System messages always kept
       if (msg.role === 'system') {
@@ -151,20 +237,26 @@ export class RequestTransformer {
 
       // Add skipped message indicator once
       if (skippedCount > 0 && i === keepFromIdx) {
-        parts.push(`[...${skippedCount}개 이전 메시지 생략...]`);
+        parts.push(`[...${skippedCount} previous messages omitted...]`);
         skippedCount = 0;
       }
 
       // Truncate tool outputs heavily
       if (msg.role === 'tool') {
-        let truncated = content.slice(0, MAX_TOOL_OUTPUT_LENGTH);
-        if (content.length > MAX_TOOL_OUTPUT_LENGTH) {
-          truncated += `... (총 ${content.length}자 중 일부만 표시)`;
+        let truncated = content.slice(0, this.maxToolOutputLength);
+        if (content.length > this.maxToolOutputLength) {
+          // Check if this is a file.read result (has SHA256)
+          const isFileRead = content.includes('SHA256:');
+          if (isFileRead) {
+            truncated += `\n\n[!] Full file content stored in system. Do NOT re-read! Use SHA256 with file.applyTextEdits.`;
+          } else {
+            truncated += `... (showing partial of ${content.length} chars)`;
+          }
         }
         parts.push(`[Tool Result]: ${truncated}`);
       } else if (msg.role === 'user') {
         if (i === lastUserIdx) {
-          parts.push(`${USER_WRAPPER_PREFIX}\n[User]: ${content}\n${USER_WRAPPER_SUFFIX}`);
+          parts.push(`${userWrapperPrefix}\n[User]: ${content}\n${USER_WRAPPER_SUFFIX}`);
         } else {
           parts.push(`[User]: ${content.slice(0, 1000)}`);
         }
@@ -211,18 +303,106 @@ export class RequestTransformer {
     // Step 5: Remove control characters except newline and tab
     result = result.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
 
+    // Step 5.5: Remove Unicode variation selectors and other invisible characters
+    // These cause "failed to parse stringified json" errors on the backend
+    result = result
+      // Variation selectors (U+FE00-U+FE0F) - make emojis colored but invisible
+      .replace(/[\uFE00-\uFE0F]/g, '')
+      // Zero-width characters
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      // Common emojis to text (warning, check, cross, etc.) - using unicode flag for proper handling
+      .replace(/\u26A0/g, '[!]')  // ⚠ Warning sign
+      .replace(/\u2713|\u2714/g, '[v]')  // ✓✔ Check marks
+      .replace(/\u2717|\u2718/g, '[x]')  // ✗✘ X marks
+      .replace(/\u274C/g, '[x]')  // ❌ Cross mark
+      .replace(/\u2705/g, '[v]')  // ✅ Check mark
+      .replace(/\u{1F4C1}|\u{1F4C2}/gu, '[DIR]')  // 📁📂 Folder
+      .replace(/\u{1F4C4}|\u{1F4C3}/gu, '[FILE]')  // 📄📃 File
+      .replace(/\u{1F4DD}/gu, '[EDIT]')  // 📝 Memo
+      .replace(/\u{1F527}|\u{1F528}/gu, '[TOOL]')  // 🔧🔨 Tools
+      .replace(/\u2753|\u2754/g, '?')  // ❓❔ Question marks
+      .replace(/\u2757|\u2755/g, '!')  // ❗❕ Exclamation marks
+      .replace(/\u{1F4A1}/gu, '[IDEA]')  // 💡 Light bulb
+      .replace(/\u{1F680}/gu, '[GO]')  // 🚀 Rocket
+      .replace(/\u231B|\u23F3/g, '[WAIT]')  // ⏳⌛ Hourglass
+      // Remove any remaining emojis (broad pattern for most emoji ranges)
+      .replace(/[\u{1F300}-\u{1F9FF}]/gu, '')
+      .replace(/[\u{2600}-\u{26FF}]/gu, '')
+      .replace(/[\u{2700}-\u{27BF}]/gu, '');
+
+    // Step 6: Replace box drawing and block characters with ASCII equivalents
+    // These Unicode characters cause "failed to parse stringified json" errors on the backend
+    result = result
+      // Horizontal lines
+      .replace(/[─━┄┅┈┉═]/g, '-')
+      // Vertical lines
+      .replace(/[│┃┆┇┊┋║]/g, '|')
+      // Corners (top-left)
+      .replace(/[┌┍┎┏╔╓╒]/g, '+')
+      // Corners (top-right)
+      .replace(/[┐┑┒┓╗╖╕]/g, '+')
+      // Corners (bottom-left)
+      .replace(/[└┕┖┗╚╙╘]/g, '+')
+      // Corners (bottom-right)
+      .replace(/[┘┙┚┛╝╜╛]/g, '+')
+      // T-junctions
+      .replace(/[├┝┞┟┠┡┢┣╠╟╞]/g, '+')
+      .replace(/[┤┥┦┧┨┩┪┫╣╢╡]/g, '+')
+      .replace(/[┬┭┮┯┰┱┲┳╦╥╤]/g, '+')
+      .replace(/[┴┵┶┷┸┹┺┻╩╨╧]/g, '+')
+      // Cross
+      .replace(/[┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋╬╫╪]/g, '+')
+      // Block elements
+      .replace(/[█▓▒░]/g, '#')
+      .replace(/[▀▄▌▐]/g, '#')
+      // Other common box characters
+      .replace(/[■□▪▫]/g, '#')
+      .replace(/[●○◐◑◒◓]/g, 'o')
+      .replace(/[◆◇◈]/g, '*')
+      .replace(/[★☆]/g, '*')
+      .replace(/[▲△▼▽◀◁▶▷]/g, '>');
+
+    // Step 7: Ensure JSON-safe (final validation)
+    result = this.ensureJsonSafe(result);
+
     return result;
+  }
+
+  /**
+   * Ensure text can be safely serialized to JSON.
+   * Does a round-trip encode/decode to catch any issues.
+   */
+  private ensureJsonSafe(text: string): string {
+    try {
+      // Test that the text can be JSON encoded
+      const encoded = JSON.stringify({ test: text });
+      // Parse it back to verify
+      JSON.parse(encoded);
+      return text;
+    } catch {
+      // If encoding fails, do more aggressive sanitization
+      // Remove any characters that could cause issues
+      let safeText = '';
+      for (const char of text) {
+        const code = char.charCodeAt(0);
+        // Keep printable ASCII, newlines, tabs, and common Unicode
+        if (char === '\n' || char === '\t' || (code >= 32 && code < 127) || code >= 160) {
+          safeText += char;
+        }
+      }
+      return safeText;
+    }
   }
 
   /**
    * Truncate text from beginning if too long, keeping recent context.
    */
   private truncateIfNeeded(text: string): string {
-    if (text.length <= MAX_TEXT_LENGTH) {
+    if (text.length <= this.maxTextLength) {
       return text;
     }
 
-    let truncated = text.slice(-MAX_TEXT_LENGTH);
+    let truncated = text.slice(-this.maxTextLength);
 
     // Find first newline to avoid cutting mid-sentence
     const firstNewline = truncated.indexOf('\n');
@@ -230,7 +410,7 @@ export class RequestTransformer {
       truncated = truncated.slice(firstNewline + 1);
     }
 
-    return `[이전 대화 일부 생략...]\n\n${truncated}`;
+    return `[Previous conversation truncated...]\n\n${truncated}`;
   }
 
   /**

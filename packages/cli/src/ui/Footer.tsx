@@ -9,13 +9,15 @@ import { Box, Text } from 'ink';
 const POSTECH_YELLOW = '#ffb300';
 
 export interface FooterProps {
-  state: 'idle' | 'streaming' | 'confirming' | 'authenticating';
+  state: 'idle' | 'streaming' | 'confirming' | 'authenticating' | 'executing_tool';
   model: string;
   isAuthenticated?: boolean;
   initializingChat?: boolean;
+  currentTool?: string;
+  threadId?: number;
 }
 
-export function Footer({ state, model, isAuthenticated = true, initializingChat = false }: FooterProps) {
+export function Footer({ state, model, isAuthenticated = true, initializingChat = false, currentTool, threadId }: FooterProps) {
   const getStatusText = () => {
     if (initializingChat) {
       return '채팅방 초기화 중...';
@@ -27,6 +29,8 @@ export function Footer({ state, model, isAuthenticated = true, initializingChat 
         return '도구 실행 확인 대기 중...';
       case 'authenticating':
         return '인증 중...';
+      case 'executing_tool':
+        return `🔧 도구 실행 중: ${currentTool || 'unknown'}...`;
       default:
         return isAuthenticated ? 'Ready' : 'Login Required';
     }
@@ -56,6 +60,12 @@ export function Footer({ state, model, isAuthenticated = true, initializingChat 
         </Text>
         <Text color="gray"> | Model: </Text>
         <Text color={POSTECH_YELLOW}>{getShortModelName()}</Text>
+        {threadId && (
+          <>
+            <Text color="gray"> | Thread: </Text>
+            <Text color="cyan">#{threadId}</Text>
+          </>
+        )}
       </Box>
       <Box>
         <Text color="gray">

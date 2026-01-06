@@ -1,0 +1,26 @@
+{
+  "name": "@popilot/mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for Popilot file operations with atomic editing support",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "popilot-mcp": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.3"
+  },
+  "files": [
+    "dist"
+  ]
+}

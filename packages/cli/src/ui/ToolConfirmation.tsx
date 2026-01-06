@@ -25,7 +25,7 @@ export function ToolConfirmation({ toolName, args, onConfirm }: ToolConfirmation
       onConfirm(selected === 'yes');
     } else if (input === 'y' || input === 'Y') {
       onConfirm(true);
-    } else if (input === 'n' || input === 'N') {
+    } else if (input === 'n' || input === 'N' || key.escape || key.backspace || key.delete) {
       onConfirm(false);
     }
   });
@@ -82,7 +82,7 @@ export function ToolConfirmation({ toolName, args, onConfirm }: ToolConfirmation
 
       <Box marginTop={1} justifyContent="center">
         <Text color="gray" dimColor>
-          ← → 선택 | Enter 확인 | Y/N 직접 입력
+          Y/Enter=실행 | N/Esc=취소 | ←→ 선택
         </Text>
       </Box>
     </Box>

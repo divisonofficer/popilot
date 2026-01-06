@@ -15,6 +15,7 @@ export interface ParsedToolBlock {
 
 /**
  * Buffers tool blocks until complete and parses them.
+ * Uses aggressive pattern matching to handle malformed/corrupted tool blocks.
  */
 export class ToolParser {
   // Patterns to detect tool block start/end
@@ -31,9 +32,12 @@ export class ToolParser {
     /CODEBLOCK/,
   ];
 
-  // Pattern to extract tool name and arguments
+  // Pattern to extract tool name and arguments - more flexible
   private static readonly TOOL_NAME_PATTERN = /TOOL_NAME:\s*(\S+)/;
-  private static readonly ARG_PATTERN = /BEGIN_ARG:\s*(\S+)\n([\s\S]*?)END_ARG/g;
+  private static readonly ARG_PATTERN = /BEGIN_ARG:\s*(\S+)\s*\n?([\s\S]*?)END_ARG/g;
+
+  // Direct extraction pattern for complete tool calls (handles corrupted streams)
+  private static readonly DIRECT_TOOL_PATTERN = /TOOL_NAME:\s*(\S+)(?:\s*\n|\s+)((?:BEGIN_ARG:\s*\S+\s*\n?[\s\S]*?END_ARG\s*)*)/g;
 
   private buffer = '';
   private inToolBlock = false;
@@ -116,7 +120,9 @@ export class ToolParser {
       return { output, isBuffering: false, toolBlock: null };
     }
 
-    // Pattern 1: END_ARG followed by closing fence
+    let closePos: number | null = null;
+
+    // Pattern 1: END_ARG followed by closing fence (tool with arguments)
     const endPattern1 = /END_ARG\s*\n?(```|\[CODE\]|CODEBLOCK)/;
     const match1 = endPattern1.exec(this.buffer);
 
@@ -124,7 +130,14 @@ export class ToolParser {
     const endPattern2 = /END_ARG\s*(\n\n|\n[^B]|$)/;
     const match2 = !match1 ? endPattern2.exec(this.buffer) : null;
 
-    let closePos: number | null = null;
+    // Pattern 3: TOOL_NAME followed by closing fence WITHOUT arguments
+    // e.g., [CODE]tool\nTOOL_NAME: list_directory\n[CODE]
+    const endPattern3 = /TOOL_NAME:\s*\S+\s*\n(```|\[CODE\]|CODEBLOCK)/;
+    const match3 = !match1 && !match2 ? endPattern3.exec(this.buffer) : null;
+
+    // Pattern 4: TOOL_NAME at end or followed by double newline (no args, no fence)
+    const endPattern4 = /TOOL_NAME:\s*\S+\s*(\n\n|$)/;
+    const match4 = !match1 && !match2 && !match3 ? endPattern4.exec(this.buffer) : null;
 
     if (match1) {
       closePos = match1.index + match1[0].length;
@@ -133,10 +146,22 @@ export class ToolParser {
       if (closePos < this.buffer.length && this.buffer[closePos] === '\n') {
         closePos += 1;
       }
+    } else if (match3) {
+      closePos = match3.index + match3[0].length;
+    } else if (match4) {
+      // Find end of TOOL_NAME line
+      const toolNameMatch = /TOOL_NAME:\s*\S+/.exec(this.buffer);
+      if (toolNameMatch) {
+        closePos = toolNameMatch.index + toolNameMatch[0].length;
+        // Include trailing newline if present
+        if (closePos < this.buffer.length && this.buffer[closePos] === '\n') {
+          closePos += 1;
+        }
+      }
     }
 
     if (closePos === null) {
-      // Still waiting for END_ARG
+      // Still waiting for tool block to complete
       return { output: '', isBuffering: true, toolBlock: null };
     }
 
@@ -229,5 +254,101 @@ export class ToolParser {
       .replace(/CODEBLOCK\s*$/, '```')
       .replace(/^\[CODE\]tool/, '```tool')
       .replace(/\[CODE\]\s*$/, '```');
+  }
+
+  /**
+   * Extract ALL tool calls from accumulated text (post-hoc parsing).
+   * This is more robust than streaming detection for corrupted output.
+   */
+  static extractAllToolCalls(text: string): ParsedToolBlock[] {
+    const results: ParsedToolBlock[] = [];
+
+    // Pattern to find TOOL_NAME declarations
+    const toolNamePattern = /TOOL_NAME:\s*(\S+)/g;
+    let match: RegExpExecArray | null;
+
+    while ((match = toolNamePattern.exec(text)) !== null) {
+      const toolName = match[1];
+      const startIdx = match.index;
+
+      // Find the end of this tool block (next TOOL_NAME or end of relevant section)
+      const nextToolMatch = /TOOL_NAME:\s*\S+/.exec(text.slice(startIdx + match[0].length));
+      const endIdx = nextToolMatch
+        ? startIdx + match[0].length + nextToolMatch.index
+        : text.length;
+
+      const blockText = text.slice(startIdx, endIdx);
+
+      // Extract arguments from this block
+      const args: Record<string, unknown> = {};
+      const argPattern = /BEGIN_ARG:\s*(\S+)\s*\n?([\s\S]*?)END_ARG/g;
+      let argMatch: RegExpExecArray | null;
+
+      while ((argMatch = argPattern.exec(blockText)) !== null) {
+        const argName = argMatch[1];
+        let argValue: unknown = argMatch[2].trim();
+
+        // Try to parse JSON for complex args
+        if (argName === 'edits') {
+          try {
+            argValue = JSON.parse(argValue as string);
+          } catch {
+            // Keep as string
+          }
+        }
+
+        args[argName] = argValue;
+      }
+
+      results.push({
+        toolName,
+        args,
+        rawBlock: blockText,
+      });
+    }
+
+    return results;
+  }
+
+  /**
+   * Remove all tool block content from text, leaving only regular output.
+   */
+  static removeToolBlocks(text: string): string {
+    let result = text;
+
+    // Remove fence-wrapped tool blocks
+    result = result.replace(/(\[CODE\]tool|```tool|CODEBLOCK\s*tool)[\s\S]*?(\[CODE\]|```|CODEBLOCK)/g, '');
+
+    // Remove standalone tool declarations and arguments
+    result = result.replace(/TOOL_NAME:\s*\S+[\s\S]*?(?=TOOL_NAME:|$)/g, (match) => {
+      // Keep text after END_ARG that's not part of tool block
+      const lastEndArg = match.lastIndexOf('END_ARG');
+      if (lastEndArg !== -1) {
+        const afterEndArg = match.slice(lastEndArg + 7);
+        // Check if there's meaningful text after (not just [CODE] or whitespace)
+        const cleanAfter = afterEndArg.replace(/\[CODE\]|```|CODEBLOCK/g, '').trim();
+        if (cleanAfter && !cleanAfter.startsWith('BEGIN_ARG')) {
+          return cleanAfter;
+        }
+      }
+      return '';
+    });
+
+    // Clean up remaining markers
+    result = result
+      .replace(/\[CODE\]tool\s*/g, '')
+      .replace(/```tool\s*/g, '')
+      .replace(/CODEBLOCK\s*tool\s*/g, '')
+      .replace(/\[CODE\]\s*/g, '')
+      .replace(/```\s*/g, '')
+      .replace(/CODEBLOCK\s*/g, '')
+      .replace(/BEGIN_ARG:\s*\S+\s*/g, '')
+      .replace(/END_ARG\s*/g, '')
+      .replace(/TOOL_NAME:\s*\S+\s*/g, '');
+
+    // Clean up excessive whitespace
+    result = result.replace(/\n{3,}/g, '\n\n').trim();
+
+    return result;
   }
 }

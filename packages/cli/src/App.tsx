@@ -2,7 +2,7 @@
  * Main App Component for Popilot CLI
  */
 
-import React, { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef } from 'react';
 import { Box, Text, useApp, useInput, useStdin } from 'ink';
 import {
   PostechClient,
@@ -14,13 +14,14 @@ import {
   RequestTransformer,
   ToolExecutor,
   ToolParser,
+  DebugLogger,
   AVAILABLE_MODELS,
   MODEL_ALIASES,
   resolveModelName,
   DEFAULT_CONFIG,
   type Message,
-  type StreamChunk,
   type ChatRoomInfo,
+  type TransformerConfig,
 } from '@popilot/core';
 import { Header } from './ui/Header.js';
 import { ChatView } from './ui/ChatView.js';
@@ -31,9 +32,10 @@ import { ToolConfirmation } from './ui/ToolConfirmation.js';
 export interface AppProps {
   model: string;
   workingDir: string;
+  transformerConfig?: TransformerConfig;
 }
 
-type AppState = 'idle' | 'streaming' | 'confirming' | 'authenticating';
+type AppState = 'idle' | 'streaming' | 'confirming' | 'authenticating' | 'executing_tool';
 
 /**
  * User profile data from POSTECH API.
@@ -49,12 +51,88 @@ interface UserProfile {
 }
 
 /**
+ * Pending loop state for tool confirmation flow.
+ * Stores the state needed to resume the agentic loop after user confirms/denies a tool.
+ */
+interface PendingLoopState {
+  iteration: number;
+  toolCalls: Array<{ toolName: string; args: Record<string, unknown> }>;
+  currentToolIndex: number;
+  conversationMessages: Message[];
+  fullDisplayResponse: string;
+  token: string;
+  initResult: {
+    userInfo: {
+      userId: number;
+      chatRoomId: number;
+      scenarioId: string;
+      email: string;
+      deptCode: string;
+      sclpstCode: string;
+      userName?: string;
+      name?: string;
+    };
+  };
+}
+
+/**
  * Default AI agent ID for chat (Robi GPT Dev).
  */
 const DEFAULT_AI_AGENT_ID = 9;
 const DEFAULT_SCENARIO_ID = 'robi-gpt-dev:workflow_wKstTOFnV25Ictc';
+const MAX_AGENT_ITERATIONS = 10;
+const MAX_ERROR_RETRIES = 3;
 
-export function App({ model, workingDir }: AppProps) {
+/**
+ * Summarize tool output for UI display (don't show full file contents).
+ */
+function summarizeToolOutput(toolName: string, args: Record<string, unknown>, result: string): string {
+  const filepath = String(args.filepath || args.dirpath || '');
+
+  switch (toolName) {
+    case 'read_file':
+    case 'file.read': {
+      // Extract line count from result
+      const linesMatch = result.match(/Lines: (\d+)/);
+      const lines = linesMatch ? linesMatch[1] : '?';
+      return `📄 파일 읽기: ${filepath} (${lines}줄)`;
+    }
+
+    case 'list_directory': {
+      const entries = result.split('\n').filter(l => l.trim()).length;
+      return `📁 디렉토리 조회: ${filepath || '.'} (${entries}개 항목)`;
+    }
+
+    case 'create_new_file':
+      return `✨ 파일 생성: ${filepath}`;
+
+    case 'edit_file':
+      return `✏️ 파일 수정: ${filepath}`;
+
+    case 'file.applyTextEdits': {
+      const edits = args.edits;
+      const editCount = Array.isArray(edits) ? edits.length : 1;
+      return `✏️ 파일 부분 수정: ${filepath} (${editCount}개 편집)`;
+    }
+
+    case 'file.search': {
+      const matchCount = result.match(/Found (\d+) matches/);
+      const matches = matchCount ? matchCount[1] : '0';
+      return `🔍 파일 검색: ${filepath} (${matches}개 일치)`;
+    }
+
+    case 'run_terminal_command': {
+      const command = String(args.command || '');
+      const shortCmd = command.length > 50 ? command.slice(0, 50) + '...' : command;
+      return `💻 명령 실행: ${shortCmd}`;
+    }
+
+    default:
+      return `🔧 ${toolName} 실행 완료`;
+  }
+}
+
+export function App({ model, workingDir, transformerConfig }: AppProps) {
   const { exit } = useApp();
   const { setRawMode } = useStdin();
 
@@ -69,6 +147,10 @@ export function App({ model, workingDir }: AppProps) {
   const [chatRoomInfo, setChatRoomInfo] = useState<ChatRoomInfo | null>(null);
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [initializingChat, setInitializingChat] = useState(false);
+  const [currentTool, setCurrentTool] = useState<string | null>(null);
+  const [pendingRetry, setPendingRetry] = useState<string | null>(null);
+  const [autoConfirm, setAutoConfirm] = useState(false);
+  const [pendingResume, setPendingResume] = useState(false);
 
   // Refs for services (initialized once)
   const servicesRef = useRef<{
@@ -77,7 +159,11 @@ export function App({ model, workingDir }: AppProps) {
     sessionService: SessionService;
     toolExecutor: ToolExecutor;
     transformer: RequestTransformer;
+    logger: DebugLogger;
   } | null>(null);
+
+  // Ref for pending loop state during tool confirmation
+  const pendingLoopStateRef = useRef<PendingLoopState | null>(null);
 
   // Initialize services
   useEffect(() => {
@@ -97,7 +183,20 @@ export function App({ model, workingDir }: AppProps) {
 
     const sessionService = new SessionService();
     const toolExecutor = new ToolExecutor({ workspaceDir: workingDir });
-    const transformer = new RequestTransformer();
+
+    // Initialize transformer with model-specific settings
+    const initialModelConfig = AVAILABLE_MODELS[model];
+    const transformer = new RequestTransformer({
+      ...transformerConfig,
+      modelProvider: initialModelConfig?.provider ?? 'anthropic',
+    });
+    const logger = new DebugLogger(workingDir, true);
+
+    console.log(`📁 Debug logs: ${logger.getLogDir()}`);
+
+    // Log transformer config if custom values are set
+    const config = transformer.getConfig();
+    console.log(`📊 Transformer config: hardLimit=${config.hardLimit}, maxTextLength=${config.maxTextLength}, maxToolOutput=${config.maxToolOutputLength}, keepRecent=${config.keepRecentMessages}, provider=${config.modelProvider}`);
 
     servicesRef.current = {
       client,
@@ -105,6 +204,7 @@ export function App({ model, workingDir }: AppProps) {
       sessionService,
       toolExecutor,
       transformer,
+      logger,
     };
 
     // Check authentication status on startup
@@ -197,7 +297,7 @@ export function App({ model, workingDir }: AppProps) {
     }
   }, [userProfile, chatRoomInfo]);
 
-  // Handle user input submission
+  // Handle user input submission with agentic loop
   const handleSubmit = useCallback(async (input: string) => {
     if (state !== 'idle' || !servicesRef.current) return;
     if (!input.trim()) return;
@@ -208,7 +308,7 @@ export function App({ model, workingDir }: AppProps) {
       return;
     }
 
-    const { client, tokenManager, sessionService, transformer } = servicesRef.current;
+    const { client, tokenManager, sessionService, transformer, toolExecutor, logger } = servicesRef.current;
 
     // Ensure session exists
     sessionService.getCurrentSession(currentModel);
@@ -222,89 +322,264 @@ export function App({ model, workingDir }: AppProps) {
     setCurrentResponse('');
     setError(null);
 
+    // Track iteration for error logging
+    let iteration = 0;
+    let loopEndReason: 'completed' | 'max_iterations' | 'error' | 'unexpected' | 'confirming' = 'unexpected';
+
+    // Filter out debugging output and tool block markers from display
+    const filterOutput = (text: string): string => {
+      return text
+        // Remove CHAR_COUNT
+        .replace(/^CHAR_COUNT=\d+\s*\n?/gm, '')
+        .replace(/CHAR_COUNT=\d+\s*/g, '')
+        // Remove tool block markers that weren't parsed (fallback)
+        .replace(/\[CODE\]tool\s*/g, '')
+        .replace(/```tool\s*/g, '')
+        .replace(/TOOL_NAME:\s*\S+\s*\n?/g, '')
+        .replace(/BEGIN_ARG:\s*\S+\s*\n?/g, '')
+        .replace(/END_ARG\s*/g, '')
+        .replace(/\[CODE\]\s*/g, '')
+        .replace(/```\s*$/g, '')
+        // Clean up multiple newlines
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    };
+
     try {
       // Get valid token
       const token = await tokenManager.getValidToken();
-      setIsAuthenticated(true); // Token obtained successfully
+      setIsAuthenticated(true);
 
-      // Initialize chat room if needed (fetches user profile, creates chat room)
+      // Initialize chat room if needed
       const initResult = await initializeChatRoom(token);
       if (!initResult) {
         throw new Error('Failed to initialize chat room');
       }
 
-      // Transform messages to POSTECH API format
-      const allMessages = [...messages, userMessage];
-      const text = transformer.transform(allMessages);
-
-      // Build payload with real user info
       const modelConfig = AVAILABLE_MODELS[currentModel];
-      const payload = PostechClient.buildPayload(
-        text,
-        initResult.userInfo,
-        modelConfig,
-        sessionService.getCurrentSession(currentModel).threadId
-      );
 
-      // Stream response
-      let fullResponse = '';
-      const toolParser = new ToolParser();
+      // Agentic loop - continue until no more tool calls or max iterations
+      let conversationMessages = [...messages, userMessage];
+      let errorRetryCount = 0;
+      let fullDisplayResponse = ''; // What we show to user (summarized)
 
-      for await (const chunk of client.streamQuery(token, payload)) {
-        if (chunk.type === 'text' && chunk.content) {
-          const { output, toolBlock } = toolParser.processChunk(chunk.content);
+      while (iteration < MAX_AGENT_ITERATIONS) {
+        iteration++;
+        logger.logIteration(iteration, 'start', `msgCount=${conversationMessages.length}`);
 
-          if (output) {
-            fullResponse += output;
-            setCurrentResponse(fullResponse);
+        // Log conversation state
+        logger.logConversation(iteration, conversationMessages);
+
+        // Transform messages to POSTECH API format
+        const text = transformer.transform(conversationMessages);
+
+        const payload = PostechClient.buildPayload(
+          text,
+          initResult.userInfo,
+          modelConfig,
+          sessionService.getCurrentSession(currentModel).threadId
+        );
+
+        // Log request
+        logger.logRequest(iteration, payload);
+
+        // Stream response - just accumulate, don't parse during streaming
+        setState('streaming');
+        let rawResponse = '';
+
+        for await (const chunk of client.streamQuery(token, payload)) {
+          if (chunk.type === 'text' && chunk.content) {
+            rawResponse += chunk.content;
+            // Show filtered output during streaming (for user feedback)
+            const displayText = filterOutput(rawResponse);
+            setCurrentResponse(fullDisplayResponse + displayText);
+          }
+          // Save threadId to session for conversation continuity (only once per session)
+          if (chunk.threadId && !sessionService.getCurrentSession(currentModel).threadId) {
+            sessionService.setThreadId(chunk.threadId);
+            console.log(`📌 Thread ID saved: ${chunk.threadId}`);
+          }
+        }
+
+        // Log raw response
+        logger.logResponse(iteration, rawResponse);
+
+        // Check for API error responses - don't add to conversation
+        const isErrorResponse = rawResponse.includes('failed to parse stringified json') ||
+          rawResponse.includes('Unexpected token') ||
+          rawResponse.includes('Internal Server Error') ||
+          (rawResponse.trim().startsWith('"') && rawResponse.includes('error'));
+
+        if (isErrorResponse) {
+          errorRetryCount++;
+          logger.logError(iteration, `API Error in response (retry ${errorRetryCount}): ${rawResponse.slice(0, 200)}`);
+
+          if (errorRetryCount >= MAX_ERROR_RETRIES) {
+            // Max retries reached - show error and break
+            fullDisplayResponse += `\n[x] API 오류가 계속 발생합니다. 대화를 새로 시작해주세요.\n`;
+            setCurrentResponse(fullDisplayResponse);
+            const errorMessage: Message = {
+              role: 'assistant',
+              content: '[API 오류로 인해 요청을 처리할 수 없습니다. /clear로 대화를 초기화해주세요.]',
+            };
+            setMessages((prev) => [...prev, errorMessage]);
+            break;
           }
 
-          if (toolBlock) {
-            // Handle tool call
-            const { toolExecutor } = servicesRef.current!;
-            if (toolExecutor.isSupported(toolBlock.toolName)) {
-              // Check if confirmation needed
-              const needsConfirmation = ['run_terminal_command', 'create_new_file', 'edit_file', 'file.applyTextEdits'].includes(toolBlock.toolName);
+          fullDisplayResponse += `\n[!] API 오류 발생, 재시도 중... (${errorRetryCount}/${MAX_ERROR_RETRIES})\n`;
+          setCurrentResponse(fullDisplayResponse);
+          // Wait a bit and retry this iteration
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          continue;
+        }
 
-              if (needsConfirmation && !DEFAULT_CONFIG.autoConfirm) {
-                setPendingToolCall({ name: toolBlock.toolName, args: toolBlock.args });
-                setState('confirming');
-                return;
-              }
+        // Reset error retry count on successful response
+        errorRetryCount = 0;
 
-              // Execute tool
-              const result = await toolExecutor.execute(toolBlock.toolName, toolBlock.args);
-              fullResponse += `\n\n=== ${toolBlock.toolName} 실행 결과 ===\n${result.result}\n`;
-              setCurrentResponse(fullResponse);
+        // Check for empty response
+        if (!rawResponse.trim()) {
+          logger.logIteration(iteration, 'aborted', 'empty_response');
+          logger.logError(iteration, 'Empty response received from API');
+          fullDisplayResponse += '\n[!] 빈 응답을 받았습니다. 재시도 중...\n';
+          setCurrentResponse(fullDisplayResponse);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          continue;
+        }
+
+        // After streaming complete, parse tool calls from full response
+        const toolCalls = ToolParser.extractAllToolCalls(rawResponse);
+        const cleanResponse = ToolParser.removeToolBlocks(rawResponse);
+
+        // Check for incomplete/malformed tool call attempts (e.g., "<!-- tools: file.read -->")
+        const looksLikeToolAttempt = /<!--\s*tools?:|tool-\w+|TOOL_NAME:|```tool/i.test(rawResponse);
+        const hasValidContent = cleanResponse.trim().length > 20;
+
+        if (toolCalls.length === 0 && looksLikeToolAttempt && !hasValidContent) {
+          logger.logIteration(iteration, 'aborted', 'malformed_tool_response');
+          logger.logError(iteration, `Malformed tool response: ${rawResponse.slice(0, 200)}`);
+          fullDisplayResponse += '\n[!] 불완전한 도구 응답. 재시도 중...\n';
+          setCurrentResponse(fullDisplayResponse);
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          continue;
+        }
+
+        // Log parsed tool calls
+        logger.logToolCalls(iteration, toolCalls);
+
+        if (toolCalls.length > 0) {
+          // Add assistant message with tool calls to conversation history FIRST
+          const assistantWithTools: Message = {
+            role: 'assistant',
+            content: cleanResponse || `[도구 ${toolCalls.length}개 호출]`,
+          };
+          conversationMessages.push(assistantWithTools);
+
+          // Execute all tool calls (using index to track position for resumption)
+          for (let toolIndex = 0; toolIndex < toolCalls.length; toolIndex++) {
+            const toolCall = toolCalls[toolIndex];
+
+            if (!toolExecutor.isSupported(toolCall.toolName)) {
+              // Log and show unsupported tool
+              logger.logError(iteration, `Unsupported tool: ${toolCall.toolName}`);
+              fullDisplayResponse += `⚠️ 미지원 도구: ${toolCall.toolName}\n`;
+              setCurrentResponse(fullDisplayResponse);
+
+              // Add skip message for unsupported tools
+              const skipMessage: Message = {
+                role: 'tool',
+                content: `[${toolCall.toolName}] 지원하지 않는 도구입니다. 지원 도구: file.read, file.search, file.applyTextEdits, run_terminal_command, list_directory, tree, create_new_file, edit_file`,
+              };
+              conversationMessages.push(skipMessage);
+              continue;
             }
+
+            // Check if confirmation needed
+            const needsConfirmation = ['run_terminal_command', 'create_new_file', 'edit_file', 'file.applyTextEdits'].includes(toolCall.toolName);
+
+            if (needsConfirmation && !autoConfirm) {
+              // Save loop state for resumption after confirmation
+              pendingLoopStateRef.current = {
+                iteration,
+                toolCalls,
+                currentToolIndex: toolIndex,
+                conversationMessages: [...conversationMessages],
+                fullDisplayResponse,
+                token,
+                initResult,
+              };
+              setPendingToolCall({ name: toolCall.toolName, args: toolCall.args });
+              setState('confirming');
+              loopEndReason = 'confirming'; // Prevent finally from resetting state
+              return;
+            }
+
+            // Execute tool
+            setState('executing_tool');
+            setCurrentTool(toolCall.toolName);
+
+            const result = await toolExecutor.execute(toolCall.toolName, toolCall.args);
+
+            // Log tool result
+            logger.logToolResult(iteration, toolCall.toolName, toolCall.args, result.result);
+
+            // Add summarized output to display response
+            const summary = summarizeToolOutput(toolCall.toolName, toolCall.args, result.result);
+            fullDisplayResponse += summary + '\n';
+            setCurrentResponse(fullDisplayResponse);
+
+            // Add full tool result to conversation for model context
+            const toolResultMessage: Message = {
+              role: 'tool',
+              content: `[${toolCall.toolName} 결과]\n${result.result}`,
+            };
+            conversationMessages.push(toolResultMessage);
+
+            setCurrentTool(null);
           }
+
+          // Continue loop to get model's response with tool results
+          setState('streaming');
+        } else {
+          // No tool calls - we're done
+          logger.logIteration(iteration, 'end', 'no_tool_calls');
+          loopEndReason = 'completed';
+
+          fullDisplayResponse += filterOutput(cleanResponse);
+          setCurrentResponse(fullDisplayResponse);
+
+          // Add final assistant message
+          const assistantMessage: Message = { role: 'assistant', content: fullDisplayResponse };
+          setMessages((prev) => [...prev, assistantMessage]);
+          sessionService.addMessage(assistantMessage);
+          logger.logLoopEnd(loopEndReason, iteration, `response_length=${fullDisplayResponse.length}`);
+          break;
         }
       }
 
-      // Flush remaining content
-      const remaining = toolParser.flush();
-      if (remaining) {
-        fullResponse += remaining;
-        setCurrentResponse(fullResponse);
+      if (iteration >= MAX_AGENT_ITERATIONS) {
+        loopEndReason = 'max_iterations';
+        fullDisplayResponse += '\n\n[!] 최대 반복 횟수에 도달했습니다.';
+        setCurrentResponse(fullDisplayResponse);
+        const assistantMessage: Message = { role: 'assistant', content: fullDisplayResponse };
+        setMessages((prev) => [...prev, assistantMessage]);
+        sessionService.addMessage(assistantMessage);
+        logger.logLoopEnd(loopEndReason, iteration);
       }
 
-      // Add assistant message
-      const assistantMessage: Message = { role: 'assistant', content: fullResponse };
-      setMessages((prev) => [...prev, assistantMessage]);
-      sessionService.addMessage(assistantMessage);
-
     } catch (err) {
-      // Handle PostechClientError with detailed logging
+      // Log error
+      loopEndReason = 'error';
+      logger.logError(0, err instanceof Error ? err : String(err));
+      logger.logLoopEnd(loopEndReason, iteration, err instanceof Error ? err.message : String(err));
+
       if (err instanceof PostechClientError) {
         const detailedLog = err.getDetailedLog();
         console.error('\n' + detailedLog);
-        // Show detailed error in UI as well
         setMessages((prev) => [...prev, {
           role: 'assistant',
           content: `**API 오류 발생**\n\`\`\`\n${detailedLog}\n\`\`\``,
         }]);
         setError(err.message);
-        // If auth failed, update auth status
         if (err.statusCode === 401) {
           setIsAuthenticated(false);
         }
@@ -312,10 +587,20 @@ export function App({ model, workingDir }: AppProps) {
         setError(err instanceof Error ? err.message : String(err));
       }
     } finally {
+      // Don't reset state if waiting for tool confirmation
+      if (loopEndReason === 'confirming') {
+        return; // User needs to confirm/deny tool first
+      }
+
+      // Log unexpected termination if loop didn't complete normally
+      if (loopEndReason === 'unexpected' && iteration > 0) {
+        logger.logLoopEnd('unexpected', iteration, 'Loop terminated without proper completion');
+      }
       setState('idle');
       setCurrentResponse('');
+      setCurrentTool(null);
     }
-  }, [state, messages, currentModel, initializeChatRoom]);
+  }, [state, messages, currentModel, initializeChatRoom, autoConfirm]);
 
   // Handle slash commands
   const handleSlashCommand = useCallback((input: string) => {
@@ -331,16 +616,43 @@ export function App({ model, workingDir }: AppProps) {
       case 'clear':
         setMessages([]);
         servicesRef.current?.sessionService.clearCurrentSession();
+        setMessages((prev) => [...prev, {
+          role: 'assistant',
+          content: '[SYSTEM] 대화가 초기화되었습니다. (Thread ID 리셋)',
+        }]);
         break;
+
+      case 'thread': {
+        const session = servicesRef.current?.sessionService.getCurrentSession(currentModel);
+        const threadId = session?.threadId;
+        const msgCount = messages.length;
+        if (threadId) {
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: `[SYSTEM] 현재 Thread: ${threadId} (메시지 ${msgCount}개)`,
+          }]);
+        } else {
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: '[SYSTEM] Thread 미생성. 첫 메시지 전송 시 생성됩니다.',
+          }]);
+        }
+        break;
+      }
 
       case 'model':
         if (args[0]) {
           const resolvedModel = resolveModelName(args[0]);
           if (resolvedModel) {
             setCurrentModel(resolvedModel);
+            // Update transformer config for model-specific settings
+            const modelConfig = AVAILABLE_MODELS[resolvedModel];
+            servicesRef.current?.transformer.updateConfig({
+              modelProvider: modelConfig.provider,
+            });
             setMessages((prev) => [...prev, {
               role: 'assistant',
-              content: `모델 변경: ${AVAILABLE_MODELS[resolvedModel].modelName} (${resolvedModel})`,
+              content: `[SYSTEM] 모델 변경: ${modelConfig.modelName}${modelConfig.provider === 'anthropic' ? ' [5KB 제한]' : ''}`,
             }]);
           } else {
             const aliases = Object.keys(MODEL_ALIASES).join(', ');
@@ -356,24 +668,133 @@ export function App({ model, workingDir }: AppProps) {
       case 'help':
         setMessages((prev) => [...prev, {
           role: 'assistant',
-          content: `**Popilot 명령어**
-/model <name> - 모델 변경 (claude, gpt, gemini)
-/clear - 대화 초기화
-/session save - 세션 저장
-/session list - 세션 목록
-/quit - 종료
-/help - 도움말`,
+          content: `[SYSTEM] 명령어: /model, /clear, /thread, /retry, /config, /autoconfirm, /session, /logout, /quit`,
         }]);
+        break;
+
+      case 'autoconfirm':
+      case 'auto': {
+        const newValue = !autoConfirm;
+        setAutoConfirm(newValue);
+        setMessages((prev) => [...prev, {
+          role: 'assistant',
+          content: `[SYSTEM] 자동승인: ${newValue ? 'ON' : 'OFF'}`,
+        }]);
+        break;
+      }
+
+      case 'config': {
+        // /config set <param> <value> or /config (show current)
+        if (args[0] === 'set' && args[1] && args[2]) {
+          const param = args[1].toLowerCase();
+          const value = parseInt(args[2], 10);
+
+          if (isNaN(value)) {
+            setError(`잘못된 값: ${args[2]} (숫자를 입력하세요)`);
+            break;
+          }
+
+          const paramMap: Record<string, string> = {
+            'hardlimit': 'hardLimit',
+            'hard-limit': 'hardLimit',
+            'maxtextlength': 'maxTextLength',
+            'max-text-length': 'maxTextLength',
+            'maxtooloutput': 'maxToolOutputLength',
+            'max-tool-output': 'maxToolOutputLength',
+            'maxtooloutputlength': 'maxToolOutputLength',
+            'keeprecent': 'keepRecentMessages',
+            'keep-recent': 'keepRecentMessages',
+            'keeprecentmessages': 'keepRecentMessages',
+          };
+
+          const configKey = paramMap[param];
+          if (!configKey) {
+            setError(`알 수 없는 파라미터: ${param}\n사용 가능: hardLimit, maxTextLength, maxToolOutput, keepRecent`);
+            break;
+          }
+
+          servicesRef.current?.transformer.updateConfig({ [configKey]: value });
+          const newConfig = servicesRef.current?.transformer.getConfig();
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: `[SYSTEM] ${configKey}=${value} (hardLimit=${newConfig?.hardLimit}, maxText=${newConfig?.maxTextLength})`,
+          }]);
+        } else {
+          const config = servicesRef.current?.transformer.getConfig();
+          if (config) {
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] 설정: hardLimit=${config.hardLimit}, maxText=${config.maxTextLength}, toolOutput=${config.maxToolOutputLength}, keepRecent=${config.keepRecentMessages}`,
+            }]);
+          }
+        }
+        break;
+      }
+
+      case 'logout':
+        if (servicesRef.current) {
+          servicesRef.current.tokenManager.clearToken();
+          setIsAuthenticated(false);
+          setChatRoomInfo(null);
+          setUserProfile(null);
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: '[SYSTEM] 로그아웃 완료',
+          }]);
+        }
         break;
 
       case 'session':
         handleSessionCommand(args);
         break;
 
+      case 'retry':
+      case 'regen': {
+        // Find last user message
+        let lastUserIdx = -1;
+        for (let i = messages.length - 1; i >= 0; i--) {
+          if (messages[i].role === 'user') {
+            lastUserIdx = i;
+            break;
+          }
+        }
+
+        if (lastUserIdx === -1) {
+          setError('재시도할 메시지가 없습니다.');
+          break;
+        }
+
+        const lastUserContent = messages[lastUserIdx].content;
+        const lastInput = typeof lastUserContent === 'string' ? lastUserContent : '';
+
+        if (!lastInput) {
+          setError('재시도할 메시지가 없습니다.');
+          break;
+        }
+
+        // Remove messages from the last user message (inclusive) - will be re-added by handleSubmit
+        const newMessages = messages.slice(0, lastUserIdx);
+        setMessages(newMessages);
+
+        // Clear and rebuild session
+        if (servicesRef.current) {
+          servicesRef.current.sessionService.clearCurrentSession();
+          // Create a new session before adding messages
+          servicesRef.current.sessionService.getCurrentSession(currentModel);
+          for (const msg of newMessages) {
+            servicesRef.current.sessionService.addMessage(msg);
+          }
+        }
+
+        // Set pending retry to trigger useEffect
+        setPendingRetry(lastInput);
+        break;
+      }
+
       default:
         setError(`알 수 없는 명령어: /${cmd}. /help로 도움말을 확인하세요.`);
     }
-  }, [exit]);
+  }, [exit, messages, autoConfirm]);
 
   // Handle session subcommands
   const handleSessionCommand = useCallback(async (args: string[]) => {
@@ -385,7 +806,7 @@ export function App({ model, workingDir }: AppProps) {
           const path = await servicesRef.current?.sessionService.saveSession();
           setMessages((prev) => [...prev, {
             role: 'assistant',
-            content: `세션이 저장되었습니다: ${path}`,
+            content: `[SYSTEM] 세션 저장: ${path}`,
           }]);
         } catch (err) {
           setError(err instanceof Error ? err.message : 'Failed to save session');
@@ -395,12 +816,10 @@ export function App({ model, workingDir }: AppProps) {
       case 'list':
         try {
           const sessions = await servicesRef.current?.sessionService.listSessions();
-          const list = sessions?.map((s) =>
-            `- ${s.id}: ${s.model} (${s.messageCount} messages)`
-          ).join('\n') || '(no sessions)';
+          const count = sessions?.length || 0;
           setMessages((prev) => [...prev, {
             role: 'assistant',
-            content: `**저장된 세션**\n${list}`,
+            content: `[SYSTEM] 저장된 세션: ${count}개`,
           }]);
         } catch (err) {
           setError(err instanceof Error ? err.message : 'Failed to list sessions');
@@ -428,41 +847,58 @@ export function App({ model, workingDir }: AppProps) {
     }
   }, []);
 
-  // Handle tool confirmation
+  // Handle tool confirmation - execute tool and prepare for loop resumption
   const handleToolConfirm = useCallback(async (confirmed: boolean) => {
-    if (!pendingToolCall || !servicesRef.current) {
+    if (!pendingToolCall || !servicesRef.current || !pendingLoopStateRef.current) {
       setState('idle');
       setPendingToolCall(null);
+      pendingLoopStateRef.current = null;
       return;
     }
 
+    const loopState = pendingLoopStateRef.current;
+    const { toolExecutor, logger } = servicesRef.current;
+
     if (confirmed) {
-      const { toolExecutor } = servicesRef.current;
+      // Execute the confirmed tool
+      setState('executing_tool');
+      setCurrentTool(pendingToolCall.name);
+
       const result = await toolExecutor.execute(pendingToolCall.name, pendingToolCall.args);
 
-      // Add tool result to response
-      setMessages((prev) => {
-        const lastMsg = prev[prev.length - 1];
-        if (lastMsg?.role === 'assistant') {
-          return [
-            ...prev.slice(0, -1),
-            {
-              ...lastMsg,
-              content: `${lastMsg.content}\n\n=== ${pendingToolCall.name} 실행 결과 ===\n${result.result}`,
-            },
-          ];
-        }
-        return prev;
-      });
+      // Log tool result
+      logger.logToolResult(loopState.iteration, pendingToolCall.name, pendingToolCall.args, result.result);
+
+      // Add summarized output to display response
+      const summary = summarizeToolOutput(pendingToolCall.name, pendingToolCall.args, result.result);
+      loopState.fullDisplayResponse += summary + '\n';
+      setCurrentResponse(loopState.fullDisplayResponse);
+
+      // Add full tool result to conversation for model context
+      const toolResultMessage: Message = {
+        role: 'tool',
+        content: `[${pendingToolCall.name} 결과]\n${result.result}`,
+      };
+      loopState.conversationMessages.push(toolResultMessage);
+
+      setCurrentTool(null);
     } else {
-      setMessages((prev) => [...prev, {
-        role: 'assistant',
-        content: `도구 실행이 취소되었습니다: ${pendingToolCall.name}`,
-      }]);
+      // Tool denied - add skip message to conversation
+      const skipMessage: Message = {
+        role: 'tool',
+        content: `[${pendingToolCall.name}] 사용자가 실행을 거부했습니다.`,
+      };
+      loopState.conversationMessages.push(skipMessage);
+      loopState.fullDisplayResponse += `⛔ ${pendingToolCall.name} 실행 취소됨\n`;
+      setCurrentResponse(loopState.fullDisplayResponse);
     }
 
-    setState('idle');
+    // Move to next tool
+    loopState.currentToolIndex++;
+
+    // Clear pending tool call and trigger loop resumption
     setPendingToolCall(null);
+    setPendingResume(true);
   }, [pendingToolCall]);
 
   // Handle keyboard input
@@ -476,6 +912,290 @@ export function App({ model, workingDir }: AppProps) {
       }
     }
   });
+
+  // Handle pending retry - useEffect to call handleSubmit after state updates
+  useEffect(() => {
+    if (pendingRetry !== null && state === 'idle') {
+      const input = pendingRetry;
+      setPendingRetry(null);
+      // Use setTimeout to ensure state has fully updated
+      setTimeout(() => {
+        handleSubmit(input);
+      }, 50);
+    }
+  }, [pendingRetry, state, handleSubmit]);
+
+  // Resume agentic loop after tool confirmation
+  const resumeAgenticLoop = useCallback(async () => {
+    if (!pendingLoopStateRef.current || !servicesRef.current) {
+      setState('idle');
+      return;
+    }
+
+    const loopState = pendingLoopStateRef.current;
+    const { client, sessionService, transformer, toolExecutor, logger } = servicesRef.current;
+    const modelConfig = AVAILABLE_MODELS[currentModel];
+
+    // Filter output helper
+    const filterOutput = (text: string): string => {
+      return text
+        .replace(/^CHAR_COUNT=\d+\s*\n?/gm, '')
+        .replace(/CHAR_COUNT=\d+\s*/g, '')
+        .replace(/\[CODE\]tool\s*/g, '')
+        .replace(/```tool\s*/g, '')
+        .replace(/TOOL_NAME:\s*\S+\s*\n?/g, '')
+        .replace(/BEGIN_ARG:\s*\S+\s*\n?/g, '')
+        .replace(/END_ARG\s*/g, '')
+        .replace(/\[CODE\]\s*/g, '')
+        .replace(/```\s*$/g, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    };
+
+    let { iteration, toolCalls, currentToolIndex, conversationMessages, fullDisplayResponse, token, initResult } = loopState;
+
+    // Track why the loop ended to prevent finally from resetting state incorrectly
+    let loopEndReason: 'completed' | 'max_iterations' | 'error' | 'unexpected' | 'confirming' = 'unexpected';
+
+    try {
+      // Continue processing remaining tools from the current iteration
+      for (let toolIndex = currentToolIndex; toolIndex < toolCalls.length; toolIndex++) {
+        const toolCall = toolCalls[toolIndex];
+
+        if (!toolExecutor.isSupported(toolCall.toolName)) {
+          // Log and show unsupported tool
+          logger.logError(iteration, `Unsupported tool: ${toolCall.toolName}`);
+          fullDisplayResponse += `⚠️ 미지원 도구: ${toolCall.toolName}\n`;
+          setCurrentResponse(fullDisplayResponse);
+
+          const skipMessage: Message = {
+            role: 'tool',
+            content: `[${toolCall.toolName}] 지원하지 않는 도구입니다. 지원 도구: file.read, file.search, file.applyTextEdits, run_terminal_command, list_directory, tree, create_new_file, edit_file`,
+          };
+          conversationMessages.push(skipMessage);
+          continue;
+        }
+
+        // Check if confirmation needed
+        const needsConfirmation = ['run_terminal_command', 'create_new_file', 'edit_file', 'file.applyTextEdits'].includes(toolCall.toolName);
+
+        if (needsConfirmation && !autoConfirm) {
+          // Save updated loop state and wait for confirmation
+          pendingLoopStateRef.current = {
+            ...loopState,
+            currentToolIndex: toolIndex,
+            conversationMessages: [...conversationMessages],
+            fullDisplayResponse,
+          };
+          setPendingToolCall({ name: toolCall.toolName, args: toolCall.args });
+          setState('confirming');
+          loopEndReason = 'confirming'; // Prevent finally from resetting state
+          return;
+        }
+
+        // Execute tool
+        setState('executing_tool');
+        setCurrentTool(toolCall.toolName);
+
+        const result = await toolExecutor.execute(toolCall.toolName, toolCall.args);
+
+        // Log tool result
+        logger.logToolResult(iteration, toolCall.toolName, toolCall.args, result.result);
+
+        // Add summarized output to display response
+        const summary = summarizeToolOutput(toolCall.toolName, toolCall.args, result.result);
+        fullDisplayResponse += summary + '\n';
+        setCurrentResponse(fullDisplayResponse);
+
+        // Add full tool result to conversation for model context
+        const toolResultMessage: Message = {
+          role: 'tool',
+          content: `[${toolCall.toolName} 결과]\n${result.result}`,
+        };
+        conversationMessages.push(toolResultMessage);
+
+        setCurrentTool(null);
+      }
+
+      // All tools from current iteration processed, continue agentic loop
+      while (iteration < MAX_AGENT_ITERATIONS) {
+        iteration++;
+
+        // Log conversation state
+        logger.logConversation(iteration, conversationMessages);
+
+        // Transform messages to POSTECH API format
+        const text = transformer.transform(conversationMessages);
+
+        const payload = PostechClient.buildPayload(
+          text,
+          initResult.userInfo,
+          modelConfig,
+          sessionService.getCurrentSession(currentModel).threadId
+        );
+
+        // Log request
+        logger.logRequest(iteration, payload);
+
+        // Stream response
+        setState('streaming');
+        let rawResponse = '';
+
+        for await (const chunk of client.streamQuery(token, payload)) {
+          if (chunk.type === 'text' && chunk.content) {
+            rawResponse += chunk.content;
+            const displayText = filterOutput(rawResponse);
+            setCurrentResponse(fullDisplayResponse + displayText);
+          }
+          // Save threadId to session for conversation continuity (only once per session)
+          if (chunk.threadId && !sessionService.getCurrentSession(currentModel).threadId) {
+            sessionService.setThreadId(chunk.threadId);
+            console.log(`📌 Thread ID saved: ${chunk.threadId}`);
+          }
+        }
+
+        // Log raw response
+        logger.logResponse(iteration, rawResponse);
+
+        // Check for API error responses
+        const isErrorResponse = rawResponse.includes('failed to parse stringified json') ||
+          rawResponse.includes('Unexpected token') ||
+          rawResponse.includes('Internal Server Error');
+
+        if (isErrorResponse) {
+          fullDisplayResponse += `\n[!] API 오류 발생. 대화를 새로 시작해주세요.\n`;
+          setCurrentResponse(fullDisplayResponse);
+          break;
+        }
+
+        // Parse tool calls from response
+        const newToolCalls = ToolParser.extractAllToolCalls(rawResponse);
+        const cleanResponse = ToolParser.removeToolBlocks(rawResponse);
+
+        // Log parsed tool calls
+        logger.logToolCalls(iteration, newToolCalls);
+
+        if (newToolCalls.length > 0) {
+          // Add assistant message with tool calls
+          const assistantWithTools: Message = {
+            role: 'assistant',
+            content: cleanResponse || `[도구 ${newToolCalls.length}개 호출]`,
+          };
+          conversationMessages.push(assistantWithTools);
+
+          // Process new tool calls
+          for (let toolIndex = 0; toolIndex < newToolCalls.length; toolIndex++) {
+            const toolCall = newToolCalls[toolIndex];
+
+            if (!toolExecutor.isSupported(toolCall.toolName)) {
+              // Log and show unsupported tool
+              logger.logError(iteration, `Unsupported tool: ${toolCall.toolName}`);
+              fullDisplayResponse += `⚠️ 미지원 도구: ${toolCall.toolName}\n`;
+              setCurrentResponse(fullDisplayResponse);
+
+              const skipMessage: Message = {
+                role: 'tool',
+                content: `[${toolCall.toolName}] 지원하지 않는 도구입니다. 지원 도구: file.read, file.search, file.applyTextEdits, run_terminal_command, list_directory, tree, create_new_file, edit_file`,
+              };
+              conversationMessages.push(skipMessage);
+              continue;
+            }
+
+            // Check if confirmation needed
+            const needsConfirmation = ['run_terminal_command', 'create_new_file', 'edit_file', 'file.applyTextEdits'].includes(toolCall.toolName);
+
+            if (needsConfirmation && !autoConfirm) {
+              // Save loop state and wait for confirmation
+              pendingLoopStateRef.current = {
+                iteration,
+                toolCalls: newToolCalls,
+                currentToolIndex: toolIndex,
+                conversationMessages: [...conversationMessages],
+                fullDisplayResponse,
+                token,
+                initResult,
+              };
+              setPendingToolCall({ name: toolCall.toolName, args: toolCall.args });
+              setState('confirming');
+              loopEndReason = 'confirming'; // Prevent finally from resetting state
+              return;
+            }
+
+            // Execute tool
+            setState('executing_tool');
+            setCurrentTool(toolCall.toolName);
+
+            const result = await toolExecutor.execute(toolCall.toolName, toolCall.args);
+
+            // Log tool result
+            logger.logToolResult(iteration, toolCall.toolName, toolCall.args, result.result);
+
+            // Add summarized output
+            const summary = summarizeToolOutput(toolCall.toolName, toolCall.args, result.result);
+            fullDisplayResponse += summary + '\n';
+            setCurrentResponse(fullDisplayResponse);
+
+            // Add tool result to conversation
+            const toolResultMessage: Message = {
+              role: 'tool',
+              content: `[${toolCall.toolName} 결과]\n${result.result}`,
+            };
+            conversationMessages.push(toolResultMessage);
+
+            setCurrentTool(null);
+          }
+
+          // Continue loop for next iteration
+          setState('streaming');
+        } else {
+          // No more tool calls - we're done
+          fullDisplayResponse += filterOutput(cleanResponse);
+          setCurrentResponse(fullDisplayResponse);
+
+          // Add final assistant message
+          const assistantMessage: Message = { role: 'assistant', content: fullDisplayResponse };
+          setMessages((prev) => [...prev, assistantMessage]);
+          sessionService.addMessage(assistantMessage);
+          loopEndReason = 'completed';
+          break;
+        }
+      }
+
+      if (iteration >= MAX_AGENT_ITERATIONS) {
+        fullDisplayResponse += '\n\n[!] 최대 반복 횟수에 도달했습니다.';
+        setCurrentResponse(fullDisplayResponse);
+        const assistantMessage: Message = { role: 'assistant', content: fullDisplayResponse };
+        setMessages((prev) => [...prev, assistantMessage]);
+        sessionService.addMessage(assistantMessage);
+        loopEndReason = 'max_iterations';
+      }
+
+    } catch (err) {
+      loopEndReason = 'error';
+      logger.logError(0, err instanceof Error ? err : String(err));
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      // Don't reset state if we're waiting for tool confirmation
+      if (loopEndReason === 'confirming') {
+        return;
+      }
+      setState('idle');
+      setCurrentResponse('');
+      setCurrentTool(null);
+      pendingLoopStateRef.current = null;
+    }
+  }, [currentModel, autoConfirm]);
+
+  // Handle pending resume - useEffect to resume agentic loop after tool confirmation
+  useEffect(() => {
+    if (pendingResume) {
+      setPendingResume(false);
+      // Use setTimeout to ensure state has fully updated
+      setTimeout(() => {
+        resumeAgenticLoop();
+      }, 50);
+    }
+  }, [pendingResume, resumeAgenticLoop]);
 
   return (
     <Box flexDirection="column" padding={1}>
@@ -511,7 +1231,7 @@ export function App({ model, workingDir }: AppProps) {
         />
       )}
 
-      <Footer state={state} model={currentModel} isAuthenticated={isAuthenticated} initializingChat={initializingChat} />
+      <Footer state={state} model={currentModel} isAuthenticated={isAuthenticated} initializingChat={initializingChat} currentTool={currentTool ?? undefined} threadId={servicesRef.current?.sessionService.getCurrentSession(currentModel).threadId} />
     </Box>
   );
 }

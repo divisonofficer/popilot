@@ -114,6 +114,7 @@ export interface PostechRequestPayload {
 }
 
 export interface SSEDocument {
+  chat_threads_id?: number;
   replies?: {
     text?: string;
   };
@@ -205,10 +206,11 @@ export interface ToolResult {
 // ============================================
 
 export interface StreamChunk {
-  type: 'text' | 'tool_call' | 'error' | 'done';
+  type: 'text' | 'tool_call' | 'error' | 'done' | 'json_parse_error';
   content?: string;
   toolCall?: ToolCall;
   error?: string;
+  threadId?: number;
 }
 
 // ============================================

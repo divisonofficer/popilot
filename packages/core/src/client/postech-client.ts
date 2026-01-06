@@ -65,6 +65,8 @@ export interface PostechClientConfig {
   apiUrl: string;
   baseUrl?: string;
   timeoutMs?: number;
+  maxRetries?: number;
+  retryDelayMs?: number;
 }
 
 /**
@@ -93,11 +95,15 @@ export class PostechClient {
   private apiUrl: string;
   private baseUrl: string;
   private timeoutMs: number;
+  private maxRetries: number;
+  private retryDelayMs: number;
 
   constructor(config: PostechClientConfig) {
     this.apiUrl = config.apiUrl;
     this.baseUrl = config.baseUrl ?? 'https://genai.postech.ac.kr';
     this.timeoutMs = config.timeoutMs ?? 60000;
+    this.maxRetries = config.maxRetries ?? 3;
+    this.retryDelayMs = config.retryDelayMs ?? 3000;
   }
 
   /**
@@ -277,10 +283,12 @@ export class PostechClient {
 
   /**
    * Stream query to POSTECH API and yield chunks.
+   * Automatically retries on JSON parsing errors.
    */
   async *streamQuery(
     token: string,
-    payload: PostechRequestPayload
+    payload: PostechRequestPayload,
+    retryCount: number = 0
   ): AsyncGenerator<StreamChunk> {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
@@ -336,6 +344,16 @@ export class PostechClient {
 
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '');
+
+        // Check for JSON parsing error and retry
+        if (errorBody.includes('failed to parse stringified json') && retryCount < this.maxRetries) {
+          console.log(`\n⚠️ JSON parsing error detected. Retrying in ${this.retryDelayMs / 1000}s... (attempt ${retryCount + 1}/${this.maxRetries})`);
+          clearTimeout(timeoutId);
+          await new Promise(resolve => setTimeout(resolve, this.retryDelayMs));
+          yield* this.streamQuery(token, payload, retryCount + 1);
+          return;
+        }
+
         throw new PostechClientError(
           `HTTP error: ${response.status} ${response.statusText}`,
           response.status,
@@ -363,7 +381,17 @@ export class PostechClient {
           // Process any remaining data in buffer
           if (buffer.trim()) {
             const chunk = this.parseSSELine(buffer.trim());
-            if (chunk) yield chunk;
+            if (chunk) {
+              // Check for JSON parse error in final chunk
+              if (chunk.type === 'json_parse_error' && chunk.threadId && retryCount < this.maxRetries) {
+                console.log(`\n⚠️ JSON parsing error in SSE. Retrying with threadId ${chunk.threadId}... (attempt ${retryCount + 1}/${this.maxRetries})`);
+                await new Promise(resolve => setTimeout(resolve, this.retryDelayMs));
+                const retryPayload = { ...payload, chat_threads_id: chunk.threadId };
+                yield* this.streamQuery(token, retryPayload, retryCount + 1);
+                return;
+              }
+              yield chunk;
+            }
           }
           break;
         }
@@ -379,7 +407,18 @@ export class PostechClient {
 
           if (line) {
             const chunk = this.parseSSELine(line);
-            if (chunk) yield chunk;
+            if (chunk) {
+              // JSON parsing error from backend - retry with threadId
+              if (chunk.type === 'json_parse_error' && chunk.threadId && retryCount < this.maxRetries) {
+                console.log(`\n⚠️ JSON parsing error in SSE. Retrying with threadId ${chunk.threadId}... (attempt ${retryCount + 1}/${this.maxRetries})`);
+                reader.cancel(); // Close current stream
+                await new Promise(resolve => setTimeout(resolve, this.retryDelayMs));
+                const retryPayload = { ...payload, chat_threads_id: chunk.threadId };
+                yield* this.streamQuery(token, retryPayload, retryCount + 1);
+                return;
+              }
+              yield chunk;
+            }
           }
         }
       }
@@ -414,6 +453,7 @@ export class PostechClient {
 
   /**
    * Parse SSE line and extract text content.
+   * Also detects JSON parsing errors and extracts thread ID for retry.
    */
   private parseSSELine(line: string): StreamChunk | null {
     if (!line.startsWith('data:')) {
@@ -428,9 +468,25 @@ export class PostechClient {
       const documents = parsed.data?.documents;
 
       if (documents && documents.length > 0) {
-        const text = documents[0].replies?.text;
+        const doc = documents[0];
+        const text = doc.replies?.text;
+        const threadId = doc.chat_threads_id;
+
         if (text) {
-          return { type: 'text', content: text };
+          // Detect JSON parsing error from backend
+          if (text.includes('failed to parse stringified json')) {
+            return {
+              type: 'json_parse_error',
+              error: text,
+              threadId,
+            };
+          }
+          return { type: 'text', content: text, threadId };
+        }
+
+        // Return threadId even if no text (for tracking)
+        if (threadId) {
+          return { type: 'text', content: '', threadId };
         }
       }
     } catch {

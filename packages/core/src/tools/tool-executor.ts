@@ -8,7 +8,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import type { ToolDefinition, ToolResult } from '../types.js';
 
 export interface ToolExecutorConfig {
@@ -39,6 +39,7 @@ export class ToolExecutor {
     'read_file',
     'run_terminal_command',
     'list_directory',
+    'tree',
   ]);
 
   constructor(config: ToolExecutorConfig) {
@@ -72,6 +73,9 @@ export class ToolExecutor {
           break;
         case 'list_directory':
           result = await this.execListDirectory(args);
+          break;
+        case 'tree':
+          result = await this.execTree(args);
           break;
         case 'create_new_file':
           result = await this.execCreateFile(args);
@@ -119,6 +123,73 @@ export class ToolExecutor {
   }
 
   /**
+   * Find similar files when file not found.
+   * Extracts filename and searches for it in workspace.
+   */
+  private findSimilarFiles(filepath: string): string[] {
+    const filename = path.basename(filepath);
+    const nameWithoutExt = path.basename(filename, path.extname(filename));
+
+    try {
+      // Use find command to search for files with same name
+      // Exclude node_modules, .git, dist, .turbo directories
+      const findCmd = `find . -type f -name "${filename}" \\
+        -not -path "*/node_modules/*" \\
+        -not -path "*/.git/*" \\
+        -not -path "*/dist/*" \\
+        -not -path "*/.turbo/*" \\
+        2>/dev/null | head -5`;
+
+      const result = execSync(findCmd, {
+        cwd: this.workspaceDir,
+        encoding: 'utf-8',
+        timeout: 5000,
+      });
+
+      const matches = result.trim().split('\n').filter(Boolean).map(f => f.replace(/^\.\//, ''));
+
+      // If no exact matches, try partial name match
+      if (matches.length === 0 && nameWithoutExt.length > 3) {
+        const partialCmd = `find . -type f -name "*${nameWithoutExt}*" \\
+          -not -path "*/node_modules/*" \\
+          -not -path "*/.git/*" \\
+          -not -path "*/dist/*" \\
+          -not -path "*/.turbo/*" \\
+          2>/dev/null | head -5`;
+
+        const partialResult = execSync(partialCmd, {
+          cwd: this.workspaceDir,
+          encoding: 'utf-8',
+          timeout: 5000,
+        });
+
+        return partialResult.trim().split('\n').filter(Boolean).map(f => f.replace(/^\.\//, ''));
+      }
+
+      return matches;
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Build file not found error with suggestions.
+   */
+  private buildFileNotFoundError(filepath: string): string {
+    const similarFiles = this.findSimilarFiles(filepath);
+
+    let error = `[Error] File not found: ${filepath}`;
+
+    if (similarFiles.length > 0) {
+      error += `\n\n[Suggestion] Did you mean one of these files?\n`;
+      error += similarFiles.map(f => `  - ${f}`).join('\n');
+      error += `\n\nPlease retry with the correct path.`;
+    }
+
+    return error;
+  }
+
+  /**
    * Read file contents.
    */
   private async execReadFile(args: Record<string, unknown>): Promise<string> {
@@ -131,7 +202,7 @@ export class ToolExecutor {
       return `SHA256: ${sha256}\nLines: ${lines.length}\n\n${content}`;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return `[Error] File not found: ${filepath}`;
+        return this.buildFileNotFoundError(filepath);
       }
       throw error;
     }
@@ -207,6 +278,66 @@ export class ToolExecutor {
   }
 
   /**
+   * Show directory tree structure recursively.
+   */
+  private async execTree(args: Record<string, unknown>): Promise<string> {
+    const dirpath = args.dirpath ? this.resolvePath(String(args.dirpath)) : this.workspaceDir;
+    const maxDepth = (args.depth as number) || 3;
+
+    // Directories to skip
+    const skipDirs = new Set(['node_modules', '.git', '.turbo', 'dist', 'build', '.next', '__pycache__', '.popilot_log']);
+
+    const buildTree = async (dir: string, prefix: string, depth: number): Promise<string[]> => {
+      if (depth > maxDepth) return [];
+
+      const lines: string[] = [];
+      try {
+        const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+        // Sort: directories first, then files
+        entries.sort((a, b) => {
+          if (a.isDirectory() && !b.isDirectory()) return -1;
+          if (!a.isDirectory() && b.isDirectory()) return 1;
+          return a.name.localeCompare(b.name);
+        });
+
+        for (let i = 0; i < entries.length; i++) {
+          const entry = entries[i];
+          const isLast = i === entries.length - 1;
+          // Use simple ASCII connectors to avoid JSON parsing issues on backend
+          const connector = '- ';
+          const newPrefix = prefix + '  ';
+
+          if (entry.isDirectory()) {
+            if (skipDirs.has(entry.name)) {
+              lines.push(`${prefix}${connector}${entry.name}/ (skipped)`);
+            } else {
+              lines.push(`${prefix}${connector}${entry.name}/`);
+              const subTree = await buildTree(path.join(dir, entry.name), newPrefix, depth + 1);
+              lines.push(...subTree);
+            }
+          } else {
+            lines.push(`${prefix}${connector}${entry.name}`);
+          }
+        }
+      } catch {
+        lines.push(`${prefix}(error reading directory)`);
+      }
+      return lines;
+    };
+
+    try {
+      const rootName = path.basename(dirpath) || dirpath;
+      const tree = await buildTree(dirpath, '', 1);
+      return [`${rootName}/`, ...tree].join('\n') || '(empty directory)';
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return `[Error] Directory not found: ${dirpath}`;
+      }
+      throw error;
+    }
+  }
+
+  /**
    * Create a new file.
    */
   private async execCreateFile(args: Record<string, unknown>): Promise<string> {
@@ -232,7 +363,7 @@ export class ToolExecutor {
     try {
       await fs.promises.access(filepath);
     } catch {
-      return `[Error] File does not exist: ${filepath}`;
+      return this.buildFileNotFoundError(filepath);
     }
 
     try {
@@ -274,7 +405,7 @@ export class ToolExecutor {
       return `Found ${matches.length} matches:\n${matches.slice(0, 50).join('\n')}\n\nSHA256: ${sha256}`;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return `[Error] File not found: ${filepath}`;
+        return this.buildFileNotFoundError(filepath);
       }
       throw error;
     }
@@ -337,7 +468,7 @@ export class ToolExecutor {
       return `Successfully applied ${edits.length} edit(s) to ${filepath}\nNew SHA256: ${newSha}`;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return `[Error] File not found: ${filepath}`;
+        return this.buildFileNotFoundError(filepath);
       }
       throw error;
     }
