@@ -33,7 +33,9 @@ export class ToolExecutor {
   static readonly SUPPORTED_TOOLS = new Set([
     'file.read',
     'file.search',
+    'file.find',
     'file.applyTextEdits',
+    'find_files',
     'create_new_file',
     'edit_file',
     'read_file',
@@ -86,6 +88,10 @@ export class ToolExecutor {
         case 'file.search':
           result = await this.execFileSearch(args);
           break;
+        case 'file.find':
+        case 'find_files':
+          result = this.execFindFiles(args);
+          break;
         case 'file.applyTextEdits':
           result = await this.execApplyEdits(args);
           break;
@@ -120,6 +126,32 @@ export class ToolExecutor {
       return filepath;
     }
     return path.join(this.workspaceDir, filepath);
+  }
+
+  /**
+   * Try to auto-correct filepath if file doesn't exist.
+   * Returns corrected path if exactly one match found, null otherwise.
+   */
+  private tryAutoCorrectPath(filepath: string): { corrected: string; originalPath: string } | null {
+    const resolved = this.resolvePath(filepath);
+
+    // If file exists, no correction needed
+    if (fs.existsSync(resolved)) {
+      return null;
+    }
+
+    // Find similar files
+    const similarFiles = this.findSimilarFiles(filepath);
+
+    // Auto-correct only if exactly one match
+    if (similarFiles.length === 1) {
+      return {
+        corrected: similarFiles[0],
+        originalPath: filepath,
+      };
+    }
+
+    return null;
   }
 
   /**
@@ -193,13 +225,26 @@ export class ToolExecutor {
    * Read file contents.
    */
   private async execReadFile(args: Record<string, unknown>): Promise<string> {
-    const filepath = this.resolvePath(String(args.filepath ?? ''));
+    const inputPath = String(args.filepath ?? '');
+
+    // Validate filepath first
+    const pathValidation = this.validateFilePath(inputPath);
+    if (!pathValidation.valid) {
+      return `[Error] Invalid filepath: ${pathValidation.error}\n\nTip: Use find_files tool first to get the exact file path, then use that path here.`;
+    }
+
+    // Try auto-correction if file doesn't exist
+    const autoCorrect = this.tryAutoCorrectPath(inputPath);
+    const filepath = autoCorrect ? this.resolvePath(autoCorrect.corrected) : this.resolvePath(inputPath);
+    const correctionNote = autoCorrect
+      ? `[Auto-corrected] ${autoCorrect.originalPath} -> ${autoCorrect.corrected}\n\n`
+      : '';
 
     try {
       const content = await fs.promises.readFile(filepath, 'utf-8');
       const sha256 = crypto.createHash('sha256').update(content).digest('hex');
       const lines = content.split('\n');
-      return `SHA256: ${sha256}\nLines: ${lines.length}\n\n${content}`;
+      return `${correctionNote}SHA256: ${sha256}\nLines: ${lines.length}\n\n${content}`;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return this.buildFileNotFoundError(filepath);
@@ -338,6 +383,50 @@ export class ToolExecutor {
   }
 
   /**
+   * Find files by name pattern.
+   * Safer alternative to run_terminal_command with find.
+   */
+  private execFindFiles(args: Record<string, unknown>): string {
+    const pattern = String(args.pattern ?? args.name ?? '');
+    const dirpath = args.dirpath ? this.resolvePath(String(args.dirpath)) : this.workspaceDir;
+    const maxResults = Math.min(Number(args.maxResults) || 20, 50);
+
+    if (!pattern) {
+      return '[Error] pattern is required (e.g., "*.tsx", "App.tsx", "*test*")';
+    }
+
+    try {
+      // Build find command with pattern
+      const findCmd = `find . -type f -name "${pattern}" \\
+        -not -path "*/node_modules/*" \\
+        -not -path "*/.git/*" \\
+        -not -path "*/dist/*" \\
+        -not -path "*/.turbo/*" \\
+        -not -path "*/.popilot_log/*" \\
+        2>/dev/null | head -${maxResults}`;
+
+      const result = execSync(findCmd, {
+        cwd: dirpath,
+        encoding: 'utf-8',
+        timeout: 10000,
+      });
+
+      const files = result.trim().split('\n').filter(Boolean).map(f => f.replace(/^\.\//, ''));
+
+      if (files.length === 0) {
+        return `No files found matching: ${pattern}`;
+      }
+
+      return `Found ${files.length} file(s) matching "${pattern}":\n${files.map(f => `  - ${f}`).join('\n')}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        return `[Error] Directory not found: ${dirpath}`;
+      }
+      return `[Error] Find failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  /**
    * Create a new file.
    */
   private async execCreateFile(args: Record<string, unknown>): Promise<string> {
@@ -412,25 +501,267 @@ export class ToolExecutor {
   }
 
   /**
-   * Apply text edits to file (atomic operation).
+   * Validate filepath is not obviously invalid.
    */
-  private async execApplyEdits(args: Record<string, unknown>): Promise<string> {
-    const filepath = this.resolvePath(String(args.filepath ?? ''));
-    const expectedSha = String(args.expectedSha256 ?? '');
-    let edits = args.edits as TextEdit[] | string;
+  private validateFilePath(filepath: string): { valid: boolean; error?: string } {
+    // Check for empty path
+    if (!filepath || filepath.trim() === '') {
+      return { valid: false, error: 'filepath is empty' };
+    }
 
-    // Parse edits if string
-    if (typeof edits === 'string') {
-      try {
-        edits = JSON.parse(edits);
-      } catch {
-        return '[Error] Invalid edits JSON';
+    // Check for Korean/CJK characters (likely placeholder text)
+    const koreanPattern = /[\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uD7B0-\uD7FF]/;
+    if (koreanPattern.test(filepath)) {
+      return {
+        valid: false,
+        error: `filepath contains Korean text: "${filepath}". Use find_files to get the exact path first!`
+      };
+    }
+
+    // Check for Chinese/Japanese characters
+    const cjkPattern = /[\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]/;
+    if (cjkPattern.test(filepath)) {
+      return {
+        valid: false,
+        error: `filepath contains CJK characters: "${filepath}". Use find_files to get the exact path first!`
+      };
+    }
+
+    // Check for placeholder patterns
+    const placeholderPatterns = [
+      /^\(.*\)$/,           // Just parentheses like "(exact path)"
+      /정확한/,              // Korean "exact"
+      /파일.*경로/,          // Korean "file path"
+      /입력/,               // Korean "input"
+      /<.*>/,               // Angle brackets like "<filepath>"
+      /\[.*path.*\]/i,      // Brackets with "path"
+      /your.*file/i,        // "your file"
+      /example/i,           // "example"
+      /placeholder/i,       // "placeholder"
+    ];
+
+    for (const pattern of placeholderPatterns) {
+      if (pattern.test(filepath)) {
+        return {
+          valid: false,
+          error: `filepath looks like a placeholder: "${filepath}". Use find_files to get the exact path!`
+        };
       }
     }
 
-    if (!Array.isArray(edits) || edits.length === 0) {
-      return '[Error] edits is required';
+    return { valid: true };
+  }
+
+  /**
+   * Validate edit object structure.
+   */
+  private validateEdit(edit: unknown, index: number): { valid: boolean; error?: string } {
+    if (typeof edit !== 'object' || edit === null) {
+      return { valid: false, error: `Edit ${index}: not an object` };
     }
+
+    const e = edit as Record<string, unknown>;
+
+    // Check for startLine
+    if (e.startLine === undefined && e.range === undefined) {
+      return { valid: false, error: `Edit ${index}: missing startLine (got: ${JSON.stringify(edit)})` };
+    }
+
+    // If using range format, convert to our format
+    if (e.range && typeof e.range === 'object') {
+      const range = e.range as Record<string, unknown>;
+      if (range.start && typeof range.start === 'object') {
+        const start = range.start as Record<string, unknown>;
+        if (typeof start.line === 'number') {
+          (edit as TextEdit).startLine = (start.line as number) + 1; // Convert 0-indexed to 1-indexed
+        }
+      }
+      if (range.end && typeof range.end === 'object') {
+        const end = range.end as Record<string, unknown>;
+        if (typeof end.line === 'number') {
+          (edit as TextEdit).endLine = (end.line as number) + 1;
+        }
+      }
+    }
+
+    // Check newText exists
+    if (e.newText === undefined) {
+      return { valid: false, error: `Edit ${index}: missing newText (got: ${JSON.stringify(edit)})` };
+    }
+
+    return { valid: true };
+  }
+
+  /**
+   * Validate syntax after file edit.
+   * Checks for common issues like unbalanced brackets, quotes, comments.
+   */
+  private validateSyntax(content: string, filepath: string): string[] {
+    const warnings: string[] = [];
+    const ext = path.extname(filepath).toLowerCase();
+
+    // Only validate code files
+    const codeExtensions = ['.ts', '.tsx', '.js', '.jsx', '.json', '.py', '.java', '.c', '.cpp', '.h', '.go', '.rs'];
+    if (!codeExtensions.includes(ext)) {
+      return warnings;
+    }
+
+    // Check bracket balance
+    const brackets: Record<string, string> = { '(': ')', '[': ']', '{': '}' };
+    const stack: Array<{ char: string; line: number }> = [];
+    const lines = content.split('\n');
+
+    let inString = false;
+    let stringChar = '';
+    let inBlockComment = false;
+    let inLineComment = false;
+
+    for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+      const line = lines[lineNum];
+      inLineComment = false;
+
+      for (let i = 0; i < line.length; i++) {
+        const char = line[i];
+        const nextChar = line[i + 1];
+        const prevChar = line[i - 1];
+
+        // Handle block comments
+        if (!inString && char === '/' && nextChar === '*') {
+          inBlockComment = true;
+          i++;
+          continue;
+        }
+        if (inBlockComment && char === '*' && nextChar === '/') {
+          inBlockComment = false;
+          i++;
+          continue;
+        }
+        if (inBlockComment) continue;
+
+        // Handle line comments
+        if (!inString && char === '/' && nextChar === '/') {
+          inLineComment = true;
+          break;
+        }
+        if (!inString && char === '#' && (ext === '.py' || ext === '.sh')) {
+          inLineComment = true;
+          break;
+        }
+        if (inLineComment) continue;
+
+        // Handle strings
+        if ((char === '"' || char === "'" || char === '`') && prevChar !== '\\') {
+          if (!inString) {
+            inString = true;
+            stringChar = char;
+          } else if (char === stringChar) {
+            inString = false;
+            stringChar = '';
+          }
+          continue;
+        }
+        if (inString) continue;
+
+        // Track brackets
+        if (brackets[char]) {
+          stack.push({ char, line: lineNum + 1 });
+        } else if (Object.values(brackets).includes(char)) {
+          const expected = Object.entries(brackets).find(([, v]) => v === char)?.[0];
+          if (stack.length === 0) {
+            warnings.push(`- Line ${lineNum + 1}: Unexpected closing '${char}' without matching opening bracket`);
+          } else if (stack[stack.length - 1].char !== expected) {
+            const last = stack.pop()!;
+            warnings.push(`- Line ${lineNum + 1}: Mismatched brackets - expected '${brackets[last.char]}' (opened at line ${last.line}), got '${char}'`);
+          } else {
+            stack.pop();
+          }
+        }
+      }
+    }
+
+    // Report unclosed brackets
+    for (const unclosed of stack) {
+      warnings.push(`- Line ${unclosed.line}: Unclosed '${unclosed.char}' - missing '${brackets[unclosed.char]}'`);
+    }
+
+    // Check for unclosed strings (simple heuristic)
+    if (inString) {
+      warnings.push(`- Unclosed string (started with '${stringChar}')`);
+    }
+
+    // Check for unclosed block comment
+    if (inBlockComment) {
+      warnings.push(`- Unclosed block comment (/* without */)`);
+    }
+
+    return warnings;
+  }
+
+  /**
+   * Apply text edits to file (atomic operation).
+   */
+  private async execApplyEdits(args: Record<string, unknown>): Promise<string> {
+    // Debug logging
+    console.log('[applyTextEdits] Raw args:', JSON.stringify(args, null, 2));
+
+    const inputPath = String(args.filepath ?? '');
+
+    // Validate filepath first
+    const pathValidation = this.validateFilePath(inputPath);
+    if (!pathValidation.valid) {
+      return `[Error] Invalid filepath: ${pathValidation.error}\n\nTip: Use find_files tool first to get the exact file path, then use that path here.`;
+    }
+
+    // Try auto-correction if file doesn't exist
+    const autoCorrect = this.tryAutoCorrectPath(inputPath);
+    const filepath = autoCorrect ? this.resolvePath(autoCorrect.corrected) : this.resolvePath(inputPath);
+    const correctionNote = autoCorrect
+      ? `[Auto-corrected] ${autoCorrect.originalPath} -> ${autoCorrect.corrected}\n`
+      : '';
+
+    const expectedSha = String(args.expectedSha256 ?? '');
+    let edits = args.edits as TextEdit[] | string | undefined;
+
+    console.log('[applyTextEdits] filepath:', inputPath);
+    console.log('[applyTextEdits] expectedSha:', expectedSha);
+    console.log('[applyTextEdits] edits type:', typeof edits);
+    console.log('[applyTextEdits] edits value:', JSON.stringify(edits, null, 2));
+
+    // Check if edits is missing entirely
+    if (edits === undefined || edits === null) {
+      return '[Error] edits parameter is missing. Required format: edits: [{ startLine: 1, endLine: 2, newText: "..." }]';
+    }
+
+    // Parse edits if string
+    if (typeof edits === 'string') {
+      const editsStr = edits;
+      if (editsStr.trim() === '') {
+        return '[Error] edits is an empty string. Required format: edits: [{ startLine: 1, endLine: 2, newText: "..." }]';
+      }
+      try {
+        edits = JSON.parse(editsStr);
+      } catch (e) {
+        return `[Error] Invalid edits JSON: ${e instanceof Error ? e.message : String(e)}\nReceived: ${editsStr.slice(0, 200)}`;
+      }
+    }
+
+    if (!Array.isArray(edits)) {
+      return `[Error] edits must be an array, got ${typeof edits}: ${JSON.stringify(edits).slice(0, 200)}`;
+    }
+
+    if (edits.length === 0) {
+      return '[Error] edits array is empty. Provide at least one edit: { startLine: 1, endLine: 2, newText: "..." }';
+    }
+
+    // Validate each edit
+    for (let i = 0; i < edits.length; i++) {
+      const editValidation = this.validateEdit(edits[i], i);
+      if (!editValidation.valid) {
+        return `[Error] ${editValidation.error}`;
+      }
+    }
+
+    console.log('[applyTextEdits] Validated edits:', JSON.stringify(edits, null, 2));
 
     try {
       const content = await fs.promises.readFile(filepath, 'utf-8');
@@ -445,6 +776,9 @@ export class ToolExecutor {
       // Sort edits by startLine descending to apply from bottom to top
       const sortedEdits = [...edits].sort((a, b) => (b.startLine ?? 0) - (a.startLine ?? 0));
 
+      // Track edit ranges for context display
+      const editRanges: Array<{ start: number; end: number; newLineCount: number }> = [];
+
       for (const edit of sortedEdits) {
         const start = (edit.startLine ?? 1) - 1; // Convert to 0-indexed
         const end = edit.endLine ?? start + 1;
@@ -457,6 +791,7 @@ export class ToolExecutor {
 
         // Replace lines
         const newLines = newText ? newText.trimEnd().split('\n') : [];
+        editRanges.push({ start, end, newLineCount: newLines.length });
         lines.splice(start, end - start, ...newLines);
       }
 
@@ -465,7 +800,39 @@ export class ToolExecutor {
       await fs.promises.writeFile(filepath, newContent, 'utf-8');
 
       const newSha = crypto.createHash('sha256').update(newContent).digest('hex');
-      return `Successfully applied ${edits.length} edit(s) to ${filepath}\nNew SHA256: ${newSha}`;
+
+      // Validate syntax after edit
+      const syntaxWarnings = this.validateSyntax(newContent, filepath);
+
+      // Show context around edited lines (first edit only for brevity)
+      let contextPreview = '';
+      if (editRanges.length > 0) {
+        // Get the first edit's location (after all edits applied)
+        const firstEdit = editRanges[editRanges.length - 1]; // Last in sorted = first in original
+        const contextStart = Math.max(0, firstEdit.start - 3);
+        const contextEnd = Math.min(lines.length, firstEdit.start + firstEdit.newLineCount + 3);
+        const contextLines = lines.slice(contextStart, contextEnd);
+
+        contextPreview = '\n\n[Modified section preview]:\n';
+        contextLines.forEach((line, i) => {
+          const lineNum = contextStart + i + 1;
+          const marker = (lineNum > firstEdit.start && lineNum <= firstEdit.start + firstEdit.newLineCount) ? '>' : ' ';
+          contextPreview += `${marker} ${lineNum}: ${line.slice(0, 120)}${line.length > 120 ? '...' : ''}\n`;
+        });
+      }
+
+      // Build result message
+      let result = `${correctionNote}Successfully applied ${edits.length} edit(s) to ${filepath}\nNew SHA256: ${newSha}`;
+
+      if (syntaxWarnings.length > 0) {
+        result += '\n\n[!!! SYNTAX WARNINGS - Please verify and fix if needed !!!]\n';
+        result += syntaxWarnings.join('\n');
+      }
+
+      result += contextPreview;
+      result += '\n\n[Tip] Use file.read to verify the full file if needed.';
+
+      return result;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return this.buildFileNotFoundError(filepath);
@@ -512,6 +879,29 @@ export class ToolExecutor {
           dirpath: {
             type: 'string',
             description: 'Path to the directory',
+            required: false,
+          },
+        },
+        requiresConfirmation: false,
+        riskLevel: 'low',
+      },
+      {
+        name: 'find_files',
+        description: 'Find files by name pattern (glob-style). Use instead of run_terminal_command with find.',
+        parameters: {
+          pattern: {
+            type: 'string',
+            description: 'File name pattern (e.g., "*.tsx", "App.tsx", "*test*")',
+            required: true,
+          },
+          dirpath: {
+            type: 'string',
+            description: 'Directory to search in (default: workspace root)',
+            required: false,
+          },
+          maxResults: {
+            type: 'number',
+            description: 'Maximum number of results (default: 20, max: 50)',
             required: false,
           },
         },

@@ -10,6 +10,8 @@ import {
   TokenManager,
   TokenStorage,
   SSOAuthenticator,
+  ApiKeyStorage,
+  ApiKeyAuthenticator,
   SessionService,
   RequestTransformer,
   ToolExecutor,
@@ -22,6 +24,7 @@ import {
   type Message,
   type ChatRoomInfo,
   type TransformerConfig,
+  type AuthMode,
 } from '@popilot/core';
 import { Header } from './ui/Header.js';
 import { ChatView } from './ui/ChatView.js';
@@ -60,7 +63,9 @@ interface PendingLoopState {
   currentToolIndex: number;
   conversationMessages: Message[];
   fullDisplayResponse: string;
-  token: string;
+  credential: string;
+  authMode: AuthMode;
+  a2Model: 'gemini' | 'gpt' | 'claude';
   initResult: {
     userInfo: {
       userId: number;
@@ -72,7 +77,7 @@ interface PendingLoopState {
       userName?: string;
       name?: string;
     };
-  };
+  } | null;
 }
 
 /**
@@ -80,7 +85,7 @@ interface PendingLoopState {
  */
 const DEFAULT_AI_AGENT_ID = 9;
 const DEFAULT_SCENARIO_ID = 'robi-gpt-dev:workflow_wKstTOFnV25Ictc';
-const MAX_AGENT_ITERATIONS = 10;
+const MAX_AGENT_ITERATIONS = 30;
 const MAX_ERROR_RETRIES = 3;
 
 /**
@@ -132,6 +137,54 @@ function summarizeToolOutput(toolName: string, args: Record<string, unknown>, re
   }
 }
 
+/**
+ * Format tool name with key parameters for display in footer.
+ */
+function formatToolDisplay(toolName: string, args: Record<string, unknown>): string {
+  const filepath = String(args.filepath || args.dirpath || '');
+  const shortPath = filepath.length > 40 ? '...' + filepath.slice(-37) : filepath;
+
+  switch (toolName) {
+    case 'read_file':
+    case 'file.read':
+      return `file.read (${shortPath || 'file'})`;
+
+    case 'list_directory':
+      return `list_directory (${shortPath || '.'})`;
+
+    case 'tree':
+      return `tree (${shortPath || '.'})`;
+
+    case 'create_new_file':
+      return `create_new_file (${shortPath})`;
+
+    case 'edit_file':
+      return `edit_file (${shortPath})`;
+
+    case 'file.applyTextEdits':
+      return `file.applyTextEdits (${shortPath})`;
+
+    case 'file.search': {
+      const pattern = String(args.pattern || '');
+      return `file.search (${shortPath}, "${pattern.slice(0, 20)}")`;
+    }
+
+    case 'find_files': {
+      const pattern = String(args.pattern || args.name || '');
+      return `find_files (${pattern})`;
+    }
+
+    case 'run_terminal_command': {
+      const command = String(args.command || '');
+      const shortCmd = command.length > 30 ? command.slice(0, 30) + '...' : command;
+      return `run_terminal_command (${shortCmd})`;
+    }
+
+    default:
+      return toolName;
+  }
+}
+
 export function App({ model, workingDir, transformerConfig }: AppProps) {
   const { exit } = useApp();
   const { setRawMode } = useStdin();
@@ -151,11 +204,14 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
   const [pendingRetry, setPendingRetry] = useState<string | null>(null);
   const [autoConfirm, setAutoConfirm] = useState(false);
   const [pendingResume, setPendingResume] = useState(false);
+  const [authMode, setAuthMode] = useState<AuthMode>('apikey');
 
   // Refs for services (initialized once)
   const servicesRef = useRef<{
     client: PostechClient;
     tokenManager: TokenManager;
+    apiKeyStorage: ApiKeyStorage;
+    apiKeyAuthenticator: ApiKeyAuthenticator;
     sessionService: SessionService;
     toolExecutor: ToolExecutor;
     transformer: RequestTransformer;
@@ -175,6 +231,12 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     const tokenManager = new TokenManager({
       storage: tokenStorage,
       authenticator,
+    });
+
+    // API Key authentication
+    const apiKeyStorage = new ApiKeyStorage();
+    const apiKeyAuthenticator = new ApiKeyAuthenticator({
+      storage: apiKeyStorage,
     });
 
     const client = new PostechClient({
@@ -201,6 +263,8 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     servicesRef.current = {
       client,
       tokenManager,
+      apiKeyStorage,
+      apiKeyAuthenticator,
       sessionService,
       toolExecutor,
       transformer,
@@ -308,7 +372,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       return;
     }
 
-    const { client, tokenManager, sessionService, transformer, toolExecutor, logger } = servicesRef.current;
+    const { client, tokenManager, apiKeyAuthenticator, sessionService, transformer, toolExecutor, logger } = servicesRef.current;
 
     // Ensure session exists
     sessionService.getCurrentSession(currentModel);
@@ -322,6 +386,14 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     setCurrentResponse('');
     setError(null);
 
+    // Determine credential and API mode
+    const modelConfig = AVAILABLE_MODELS[currentModel];
+    let a2Model: 'gemini' | 'gpt' | 'claude' = 'gemini';
+    if (modelConfig.provider === 'azure') a2Model = 'gpt';
+    else if (modelConfig.provider === 'anthropic') a2Model = 'claude';
+    else if (modelConfig.provider === 'google') a2Model = 'gemini';
+
+    // Full agentic loop with tools (both API key and SSO modes)
     // Track iteration for error logging
     let iteration = 0;
     let loopEndReason: 'completed' | 'max_iterations' | 'error' | 'unexpected' | 'confirming' = 'unexpected';
@@ -346,17 +418,22 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     };
 
     try {
-      // Get valid token
-      const token = await tokenManager.getValidToken();
-      setIsAuthenticated(true);
+      // Get credential based on auth mode
+      let credential: string;
+      let initResult: { userInfo: { userId: number; chatRoomId: number; scenarioId: string; email: string; deptCode: string; sclpstCode: string; userName?: string; name?: string; } } | null = null;
 
-      // Initialize chat room if needed
-      const initResult = await initializeChatRoom(token);
-      if (!initResult) {
-        throw new Error('Failed to initialize chat room');
+      if (authMode === 'apikey') {
+        credential = await apiKeyAuthenticator.getApiKey();
+        setIsAuthenticated(true);
+      } else {
+        // SSO mode - get token and initialize chat room
+        credential = await tokenManager.getValidToken();
+        setIsAuthenticated(true);
+        initResult = await initializeChatRoom(credential);
+        if (!initResult) {
+          throw new Error('Failed to initialize chat room');
+        }
       }
-
-      const modelConfig = AVAILABLE_MODELS[currentModel];
 
       // Agentic loop - continue until no more tool calls or max iterations
       let conversationMessages = [...messages, userMessage];
@@ -370,34 +447,42 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         // Log conversation state
         logger.logConversation(iteration, conversationMessages);
 
-        // Transform messages to POSTECH API format
+        // Transform messages to POSTECH API format (includes system prompt with tools)
         const text = transformer.transform(conversationMessages);
-
-        const payload = PostechClient.buildPayload(
-          text,
-          initResult.userInfo,
-          modelConfig,
-          sessionService.getCurrentSession(currentModel).threadId
-        );
-
-        // Log request
-        logger.logRequest(iteration, payload);
 
         // Stream response - just accumulate, don't parse during streaming
         setState('streaming');
         let rawResponse = '';
 
-        for await (const chunk of client.streamQuery(token, payload)) {
-          if (chunk.type === 'text' && chunk.content) {
-            rawResponse += chunk.content;
-            // Show filtered output during streaming (for user feedback)
-            const displayText = filterOutput(rawResponse);
-            setCurrentResponse(fullDisplayResponse + displayText);
+        if (authMode === 'apikey') {
+          // A2 API - simpler payload
+          for await (const chunk of client.streamQueryA2(credential, text, a2Model, false)) {
+            if (chunk.type === 'text' && chunk.content) {
+              rawResponse = chunk.content; // A2 returns full response, not incremental
+              const displayText = filterOutput(rawResponse);
+              setCurrentResponse(fullDisplayResponse + displayText);
+            }
           }
-          // Save threadId to session for conversation continuity (only once per session)
-          if (chunk.threadId && !sessionService.getCurrentSession(currentModel).threadId) {
-            sessionService.setThreadId(chunk.threadId);
-            console.log(`📌 Thread ID saved: ${chunk.threadId}`);
+        } else {
+          // SSO API - full payload with chat room
+          const payload = PostechClient.buildPayload(
+            text,
+            initResult!.userInfo,
+            modelConfig,
+            sessionService.getCurrentSession(currentModel).threadId
+          );
+          logger.logRequest(iteration, payload);
+
+          for await (const chunk of client.streamQuery(credential, payload)) {
+            if (chunk.type === 'text' && chunk.content) {
+              rawResponse += chunk.content;
+              const displayText = filterOutput(rawResponse);
+              setCurrentResponse(fullDisplayResponse + displayText);
+            }
+            // Save threadId for SSO mode
+            if (chunk.threadId && !sessionService.getCurrentSession(currentModel).threadId) {
+              sessionService.setThreadId(chunk.threadId);
+            }
           }
         }
 
@@ -504,7 +589,9 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
                 currentToolIndex: toolIndex,
                 conversationMessages: [...conversationMessages],
                 fullDisplayResponse,
-                token,
+                credential,
+                authMode,
+                a2Model,
                 initResult,
               };
               setPendingToolCall({ name: toolCall.toolName, args: toolCall.args });
@@ -515,7 +602,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
             // Execute tool
             setState('executing_tool');
-            setCurrentTool(toolCall.toolName);
+            setCurrentTool(formatToolDisplay(toolCall.toolName, toolCall.args));
 
             const result = await toolExecutor.execute(toolCall.toolName, toolCall.args);
 
@@ -668,7 +755,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       case 'help':
         setMessages((prev) => [...prev, {
           role: 'assistant',
-          content: `[SYSTEM] 명령어: /model, /clear, /thread, /retry, /config, /autoconfirm, /session, /logout, /quit`,
+          content: `[SYSTEM] 명령어: /model, /clear, /thread, /retry, /config, /autoconfirm, /session, /api, /sso, /auth, /logout, /quit`,
         }]);
         break;
 
@@ -748,6 +835,72 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         handleSessionCommand(args);
         break;
 
+      case 'api': {
+        // /api - switch to API key mode
+        // /api set <key> - save API key
+        // /api clear - clear saved API key
+        if (!args[0]) {
+          // Switch to API key mode
+          setAuthMode('apikey');
+          servicesRef.current?.client.setAuthMode('apikey');
+          setChatRoomInfo(null); // Clear chat room (not needed for API key mode)
+          setUserProfile(null);
+          const hasKey = servicesRef.current?.apiKeyAuthenticator.hasApiKey();
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: `[SYSTEM] API 키 모드로 전환되었습니다. ${hasKey ? '(저장된 키 사용)' : '(키 미설정 - /api set <key>)'}`,
+          }]);
+        } else if (args[0] === 'set' && args[1]) {
+          const key = args.slice(1).join(' ').trim();
+          servicesRef.current?.apiKeyStorage.saveApiKey(key);
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: '[SYSTEM] API 키가 저장되었습니다.',
+          }]);
+        } else if (args[0] === 'clear') {
+          servicesRef.current?.apiKeyStorage.clearApiKey();
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: '[SYSTEM] 저장된 API 키가 삭제되었습니다.',
+          }]);
+        } else {
+          setError('사용법: /api, /api set <key>, /api clear');
+        }
+        break;
+      }
+
+      case 'sso': {
+        // Switch back to SSO mode
+        setAuthMode('sso');
+        servicesRef.current?.client.setAuthMode('sso');
+        setMessages((prev) => [...prev, {
+          role: 'assistant',
+          content: '[SYSTEM] SSO 모드로 전환되었습니다.',
+        }]);
+        break;
+      }
+
+      case 'auth': {
+        // Show current auth status
+        const mode = authMode;
+        const services = servicesRef.current;
+        let status = `모드: ${mode.toUpperCase()}`;
+
+        if (mode === 'sso') {
+          const hasToken = services?.tokenManager.hasValidToken();
+          status += hasToken ? ' (인증됨)' : ' (미인증)';
+        } else {
+          const keySource = services?.apiKeyAuthenticator.getKeySource();
+          status += keySource === 'env' ? ' (환경변수)' : keySource === 'stored' ? ' (저장됨)' : ' (미설정)';
+        }
+
+        setMessages((prev) => [...prev, {
+          role: 'assistant',
+          content: `[SYSTEM] 인증 상태: ${status}`,
+        }]);
+        break;
+      }
+
       case 'retry':
       case 'regen': {
         // Find last user message
@@ -794,7 +947,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       default:
         setError(`알 수 없는 명령어: /${cmd}. /help로 도움말을 확인하세요.`);
     }
-  }, [exit, messages, autoConfirm]);
+  }, [exit, messages, autoConfirm, authMode]);
 
   // Handle session subcommands
   const handleSessionCommand = useCallback(async (args: string[]) => {
@@ -862,7 +1015,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     if (confirmed) {
       // Execute the confirmed tool
       setState('executing_tool');
-      setCurrentTool(pendingToolCall.name);
+      setCurrentTool(formatToolDisplay(pendingToolCall.name, pendingToolCall.args));
 
       const result = await toolExecutor.execute(pendingToolCall.name, pendingToolCall.args);
 
@@ -952,7 +1105,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         .trim();
     };
 
-    let { iteration, toolCalls, currentToolIndex, conversationMessages, fullDisplayResponse, token, initResult } = loopState;
+    let { iteration, toolCalls, currentToolIndex, conversationMessages, fullDisplayResponse, credential, authMode: loopAuthMode, a2Model: loopA2Model, initResult } = loopState;
 
     // Track why the loop ended to prevent finally from resetting state incorrectly
     let loopEndReason: 'completed' | 'max_iterations' | 'error' | 'unexpected' | 'confirming' = 'unexpected';
@@ -995,7 +1148,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
         // Execute tool
         setState('executing_tool');
-        setCurrentTool(toolCall.toolName);
+        setCurrentTool(formatToolDisplay(toolCall.toolName, toolCall.args));
 
         const result = await toolExecutor.execute(toolCall.toolName, toolCall.args);
 
@@ -1027,30 +1180,38 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         // Transform messages to POSTECH API format
         const text = transformer.transform(conversationMessages);
 
-        const payload = PostechClient.buildPayload(
-          text,
-          initResult.userInfo,
-          modelConfig,
-          sessionService.getCurrentSession(currentModel).threadId
-        );
-
-        // Log request
-        logger.logRequest(iteration, payload);
-
         // Stream response
         setState('streaming');
         let rawResponse = '';
 
-        for await (const chunk of client.streamQuery(token, payload)) {
-          if (chunk.type === 'text' && chunk.content) {
-            rawResponse += chunk.content;
-            const displayText = filterOutput(rawResponse);
-            setCurrentResponse(fullDisplayResponse + displayText);
+        if (loopAuthMode === 'apikey') {
+          // A2 API
+          for await (const chunk of client.streamQueryA2(credential, text, loopA2Model, false)) {
+            if (chunk.type === 'text' && chunk.content) {
+              rawResponse = chunk.content;
+              const displayText = filterOutput(rawResponse);
+              setCurrentResponse(fullDisplayResponse + displayText);
+            }
           }
-          // Save threadId to session for conversation continuity (only once per session)
-          if (chunk.threadId && !sessionService.getCurrentSession(currentModel).threadId) {
-            sessionService.setThreadId(chunk.threadId);
-            console.log(`📌 Thread ID saved: ${chunk.threadId}`);
+        } else {
+          // SSO API
+          const payload = PostechClient.buildPayload(
+            text,
+            initResult!.userInfo,
+            modelConfig,
+            sessionService.getCurrentSession(currentModel).threadId
+          );
+          logger.logRequest(iteration, payload);
+
+          for await (const chunk of client.streamQuery(credential, payload)) {
+            if (chunk.type === 'text' && chunk.content) {
+              rawResponse += chunk.content;
+              const displayText = filterOutput(rawResponse);
+              setCurrentResponse(fullDisplayResponse + displayText);
+            }
+            if (chunk.threadId && !sessionService.getCurrentSession(currentModel).threadId) {
+              sessionService.setThreadId(chunk.threadId);
+            }
           }
         }
 
@@ -1112,7 +1273,9 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
                 currentToolIndex: toolIndex,
                 conversationMessages: [...conversationMessages],
                 fullDisplayResponse,
-                token,
+                credential,
+                authMode: loopAuthMode,
+                a2Model: loopA2Model,
                 initResult,
               };
               setPendingToolCall({ name: toolCall.toolName, args: toolCall.args });
@@ -1123,7 +1286,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
             // Execute tool
             setState('executing_tool');
-            setCurrentTool(toolCall.toolName);
+            setCurrentTool(formatToolDisplay(toolCall.toolName, toolCall.args));
 
             const result = await toolExecutor.execute(toolCall.toolName, toolCall.args);
 

@@ -8,10 +8,11 @@
 import type { Message, ContentPart } from '../types.js';
 
 // Default configuration constants
-const DEFAULT_HARD_LIMIT = 4400;
-const DEFAULT_MAX_TEXT_LENGTH = 60000;
-const DEFAULT_MAX_TOOL_OUTPUT_LENGTH = 4000;  // Increased from 800 to prevent re-reading files
-const DEFAULT_KEEP_RECENT_MESSAGES = 6;
+// A2 API has more generous limits, so we can afford larger contexts
+const DEFAULT_HARD_LIMIT = 8000;              // Increased for A2 API (was 4400)
+const DEFAULT_MAX_TEXT_LENGTH = 120000;        // Doubled for A2 API (was 60000)
+const DEFAULT_MAX_TOOL_OUTPUT_LENGTH = 8000;   // Doubled for A2 API (was 4000) - includes validation output
+const DEFAULT_KEEP_RECENT_MESSAGES = 10;       // Keep more context (was 6)
 
 /**
  * Configuration options for RequestTransformer.
@@ -52,7 +53,7 @@ You are a coding agent that directly modifies code. Do NOT explain - EXECUTE!
 1. File modification request -> MUST use tools (NO explanations!)
 2. Markdown code blocks FORBIDDEN! -> Use [CODE]tool format only
 3. Here is how to do it FORBIDDEN! -> Directly call tools to modify
-4. Unknown file location -> Use tree/list_directory to find
+4. Unknown file location -> Use find_files (e.g., pattern="App.tsx")
 
 [!] Explanation-only responses are considered FAILURE!
 
@@ -89,17 +90,43 @@ END_ARG
    Args: filepath (required), expectedSha256 (required), edits (required)
    Workflow: file.read to get sha256 -> file.applyTextEdits to modify
 
+   [!!!] EDITS FORMAT (REQUIRED):
+   edits: [
+     { "startLine": 10, "endLine": 15, "newText": "replacement code here" }
+   ]
+   - startLine: first line to replace (1-indexed)
+   - endLine: last line to replace (1-indexed)
+   - newText: replacement text (can be multi-line string)
+
+   [X] WRONG FORMAT (DO NOT USE):
+   - edits: [{ "range": {...} }]  <- WRONG!
+   - edits: []  <- WRONG! Must have at least one edit
+   - edits: null/undefined  <- WRONG!
+
 8. run_terminal_command - Execute terminal command
    Args: command (required)
 
 9. tree - Show project structure tree (recursive)
    Args: dirpath (optional), depth (optional, default: 3)
 
+10. find_files - Find files by name pattern (RECOMMENDED for locating files!)
+    Args: pattern (required, e.g., "*.tsx", "App.tsx", "*config*")
+    [!] Use this instead of run_terminal_command with find!
+
 # File modification workflow:
-1. tree to understand project structure
-2. file.search to find location (get line number)
+1. find_files to locate target file (e.g., pattern="App.tsx")
+2. file.search to find exact location in file (get line number)
 3. file.read with startLine/endLine to read only needed part
 4. file.applyTextEdits for partial modification
+5. CHECK the [Modified section preview] in result!
+6. If [SYNTAX WARNINGS] appear, FIX immediately with another file.applyTextEdits
+
+# [!!!] POST-EDIT VERIFICATION [!!!]
+- file.applyTextEdits now returns syntax validation warnings
+- If you see [SYNTAX WARNINGS], you MUST fix them immediately!
+- Common issues: unclosed brackets, broken comments, mismatched quotes
+- Use the [Modified section preview] to verify your edit is correct
+- If edit looks wrong, fix it with another file.applyTextEdits call
 
 # Rules:
 - MUST call tools for file operations
@@ -107,10 +134,28 @@ END_ARG
 - startLine/endLine: 1-indexed
 - Do NOT explain - call tools!
 
+# [!!!] FILE PATH RULES [!!!]
+- ALWAYS use EXACT paths from find_files or tree results
+- NEVER guess or shorten paths (e.g., "App.tsx" is WRONG, use "packages/cli/src/App.tsx")
+- Paths are RELATIVE to workspace root
+- If unsure, use find_files FIRST to get correct path
+- Copy-paste paths exactly from tool results!
+
+[X] WRONG PATHS (SYSTEM WILL REJECT):
+- "(정확한 파일 경로)"  <- NO! Korean placeholder text!
+- "(Enter file path here)"  <- NO! Placeholder!
+- "App.tsx"  <- NO! Missing directory path!
+- "<filepath>"  <- NO! Angle bracket placeholder!
+- "example/file.ts"  <- NO! Must be real path from find_files!
+
+[O] CORRECT PATH EXAMPLES:
+- "packages/cli/src/App.tsx"  <- YES! Full relative path
+- "packages/core/src/client/postech-client.ts"  <- YES! From find_files result
+
 # [!!!] Tool call limit [!!!]
-- Max 2-3 tools per response!
+- Max 3-5 tools per response (A2 API allows more)
 - Need more? Call in next response after getting results
-- Reason: Too many tool calls cause context overflow error
+- Complex edits: break into multiple file.applyTextEdits calls
 
 # [!!!] FORBIDDEN behaviors [!!!]
 1. Please provide file path - FORBIDDEN! Use tree/list_directory
@@ -180,11 +225,11 @@ export class RequestTransformer {
     const userWrapperPrefix = generateUserWrapperPrefix(this.hardLimit);
     const parts: string[] = [];
 
-    // Only add response length constraint for Claude (anthropic) due to 5KB API limit
-    if (this.modelProvider === 'anthropic') {
-      const responseConstraint = generateResponseConstraint(this.hardLimit);
-      parts.push(responseConstraint);
-    }
+    // // Only add response length constraint for Claude (anthropic) due to 5KB API limit
+    // if (this.modelProvider === 'anthropic') {
+    //   const responseConstraint = generateResponseConstraint(this.hardLimit);
+    //   parts.push(responseConstraint);
+    // }
 
     // Add GPT-specific tool reminder (GPT tends to think it can't use tools)
     if (this.modelProvider === 'azure' || this.modelProvider === 'google') {

@@ -12,6 +12,7 @@ export {
   type PostechClientConfig,
   type AIAgent,
   type ChatRoomInfo,
+  type AuthMode,
 } from './client/postech-client.js';
 export { RequestTransformer, type TransformerConfig } from './client/request-transformer.js';
 
@@ -27,6 +28,12 @@ export {
   AuthenticationError,
 } from './auth/sso-authenticator.js';
 export { TokenManager, type TokenManagerConfig } from './auth/token-manager.js';
+export { ApiKeyStorage } from './auth/apikey-storage.js';
+export {
+  ApiKeyAuthenticator,
+  type ApiKeyAuthenticatorConfig,
+  ApiKeyAuthenticationError,
+} from './auth/apikey-authenticator.js';
 
 // Tools
 export {

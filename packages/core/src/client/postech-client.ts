@@ -61,9 +61,12 @@ function truncateForLog(str: string, maxLength: number = 500): string {
   return str.slice(0, maxLength) + '... [truncated]';
 }
 
+export type AuthMode = 'sso' | 'apikey';
+
 export interface PostechClientConfig {
   apiUrl: string;
   baseUrl?: string;
+  authMode?: AuthMode;
   timeoutMs?: number;
   maxRetries?: number;
   retryDelayMs?: number;
@@ -94,16 +97,42 @@ export interface ChatRoomInfo {
 export class PostechClient {
   private apiUrl: string;
   private baseUrl: string;
+  private authMode: AuthMode;
   private timeoutMs: number;
   private maxRetries: number;
   private retryDelayMs: number;
 
   constructor(config: PostechClientConfig) {
     this.apiUrl = config.apiUrl;
-    this.baseUrl = config.baseUrl ?? 'https://genai.postech.ac.kr';
+    this.baseUrl = 'https://genai.postech.ac.kr';
+    this.authMode = config.authMode ?? 'sso';
     this.timeoutMs = config.timeoutMs ?? 60000;
     this.maxRetries = config.maxRetries ?? 3;
     this.retryDelayMs = config.retryDelayMs ?? 3000;
+  }
+
+  /**
+   * Set auth mode dynamically.
+   */
+  setAuthMode(mode: AuthMode): void {
+    this.authMode = mode;
+  }
+
+  /**
+   * Get current auth mode.
+   */
+  getAuthMode(): AuthMode {
+    return this.authMode;
+  }
+
+  /**
+   * Build authorization headers based on auth mode.
+   */
+  private buildAuthHeaders(credential: string): Record<string, string> {
+    if (this.authMode === 'apikey') {
+      return { 'X-Api-Key': credential };
+    }
+    return { Authorization: `Bearer ${credential}` };
   }
 
   /**
@@ -118,13 +147,14 @@ export class PostechClient {
     const response = await fetch(url, {
       method: 'GET',
       headers: {
-        'Authorization': `Bearer ${token}`,
+        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
-        'Accept': 'application/json, text/plain, */*',
-        'Origin': this.baseUrl,
-        'Referer': `${this.baseUrl}/home`,
+        Accept: 'application/json, text/plain, */*',
+        Origin: this.baseUrl,
+        Referer: `${this.baseUrl}/home`,
         'Cache-Control': 'no-store',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
       },
     });
 
@@ -135,7 +165,7 @@ export class PostechClient {
       );
     }
 
-    const data = await response.json() as {
+    const data = (await response.json()) as {
       data?: Array<{ aiAgents?: AIAgent[] }>;
     };
     console.log(`Response: ${JSON.stringify(data).slice(0, 200)}...`);
@@ -177,13 +207,14 @@ export class PostechClient {
     const response = await fetch(url, {
       method: 'GET',
       headers: {
-        'Authorization': `Bearer ${token}`,
+        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
-        'Accept': 'application/json, text/plain, */*',
-        'Origin': this.baseUrl,
-        'Referer': `${this.baseUrl}/home`,
+        Accept: 'application/json, text/plain, */*',
+        Origin: this.baseUrl,
+        Referer: `${this.baseUrl}/home`,
         'Cache-Control': 'no-store',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
       },
     });
 
@@ -211,7 +242,7 @@ export class PostechClient {
         }>;
       };
     }
-    const data = await response.json() as UserProfileResponse;
+    const data = (await response.json()) as UserProfileResponse;
     console.log(`Response: User ${data.data?.documents?.[0]?.name}`);
 
     if (data.data?.documents?.[0]) {
@@ -234,13 +265,14 @@ export class PostechClient {
     const response = await fetch(url, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${token}`,
+        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
-        'Accept': 'application/json, text/plain, */*',
-        'Origin': this.baseUrl,
-        'Referer': `${this.baseUrl}/home`,
+        Accept: 'application/json, text/plain, */*',
+        Origin: this.baseUrl,
+        Referer: `${this.baseUrl}/home`,
         'Cache-Control': 'no-store',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
       },
       body: JSON.stringify({ aiAgentsId }),
     });
@@ -253,11 +285,11 @@ export class PostechClient {
         {
           url,
           headers: {
-            'Authorization': 'Bearer ...',
+            Authorization: 'Bearer ...',
             'Content-Type': 'application/json',
-            'Accept': 'application/json, text/plain, */*',
-            'Origin': this.baseUrl,
-            'Referer': `${this.baseUrl}/home`,
+            Accept: 'application/json, text/plain, */*',
+            Origin: this.baseUrl,
+            Referer: `${this.baseUrl}/home`,
             'Cache-Control': 'no-store',
           },
           bodyPreview: `{"aiAgentsId": ${aiAgentsId}}`,
@@ -266,7 +298,7 @@ export class PostechClient {
       );
     }
 
-    const data = await response.json() as {
+    const data = (await response.json()) as {
       data?: { chatRoomsId: number; usersId: number };
     };
     console.log(`Response: ${JSON.stringify(data)}`);
@@ -284,9 +316,11 @@ export class PostechClient {
   /**
    * Stream query to POSTECH API and yield chunks.
    * Automatically retries on JSON parsing errors.
+   *
+   * @param credential - SSO token or API key depending on auth mode
    */
   async *streamQuery(
-    token: string,
+    credential: string,
     payload: PostechRequestPayload,
     retryCount: number = 0
   ): AsyncGenerator<StreamChunk> {
@@ -294,8 +328,13 @@ export class PostechClient {
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
     // Prepare request info for logging
-    const requestHeaders = {
-      Authorization: `Bearer ${token.slice(0, 20)}...`, // Mask token
+    const authHeaders = this.buildAuthHeaders(credential);
+    const maskedCredential =
+      this.authMode === 'apikey'
+        ? `X-Api-Key: ${credential.slice(0, 8)}...`
+        : `Bearer ${credential.slice(0, 20)}...`;
+    const requestHeaders: Record<string, string> = {
+      Authorization: maskedCredential,
       'Content-Type': 'application/json',
       Accept: 'text/event-stream',
     };
@@ -309,6 +348,7 @@ export class PostechClient {
     // Debug logging
     console.log('\n=== POSTECH API Request ===');
     console.log(`URL: ${this.apiUrl}`);
+    console.log(`Auth Mode: ${this.authMode}`);
     console.log(`Body: ${truncateForLog(bodyStr, 500)}`);
     console.log('===========================\n');
 
@@ -316,13 +356,19 @@ export class PostechClient {
       const response = await fetch(this.apiUrl, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${token}`,
+          ...authHeaders,
           'Content-Type': 'application/json',
-          'Accept': 'text/event-stream',
-          'Origin': this.baseUrl,
-          'Referer': `${this.baseUrl}/home`,
+          Accept: 'text/event-stream',
+          'x-role-ratelimit-allowed': 'true',
+          'x-role-ratelimit-token-limit': '22000000',
+          'x-role-ratelimit-token-limit-interval': 'MONTHLY',
+          'x-role-ratelimit-token-usage': '2000167',
+
+          Origin: this.baseUrl,
+          Referer: `${this.baseUrl}/home`,
           'Cache-Control': 'no-store',
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
         },
         body: bodyStr,
         signal: controller.signal,
@@ -330,27 +376,27 @@ export class PostechClient {
 
       if (response.status === 401) {
         const errorBody = await response.text().catch(() => '');
-        throw new PostechClientError(
-          'Authentication failed. Please re-login.',
-          401,
-          requestInfo,
-          {
-            status: response.status,
-            statusText: response.statusText,
-            bodyPreview: truncateForLog(errorBody, 300),
-          }
-        );
+        throw new PostechClientError('Authentication failed. Please re-login.', 401, requestInfo, {
+          status: response.status,
+          statusText: response.statusText,
+          bodyPreview: truncateForLog(errorBody, 300),
+        });
       }
 
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '');
 
         // Check for JSON parsing error and retry
-        if (errorBody.includes('failed to parse stringified json') && retryCount < this.maxRetries) {
-          console.log(`\n⚠️ JSON parsing error detected. Retrying in ${this.retryDelayMs / 1000}s... (attempt ${retryCount + 1}/${this.maxRetries})`);
+        if (
+          errorBody.includes('failed to parse stringified json') &&
+          retryCount < this.maxRetries
+        ) {
+          console.log(
+            `\n⚠️ JSON parsing error detected. Retrying in ${this.retryDelayMs / 1000}s... (attempt ${retryCount + 1}/${this.maxRetries})`
+          );
           clearTimeout(timeoutId);
-          await new Promise(resolve => setTimeout(resolve, this.retryDelayMs));
-          yield* this.streamQuery(token, payload, retryCount + 1);
+          await new Promise((resolve) => setTimeout(resolve, this.retryDelayMs));
+          yield* this.streamQuery(credential, payload, retryCount + 1);
           return;
         }
 
@@ -383,11 +429,17 @@ export class PostechClient {
             const chunk = this.parseSSELine(buffer.trim());
             if (chunk) {
               // Check for JSON parse error in final chunk
-              if (chunk.type === 'json_parse_error' && chunk.threadId && retryCount < this.maxRetries) {
-                console.log(`\n⚠️ JSON parsing error in SSE. Retrying with threadId ${chunk.threadId}... (attempt ${retryCount + 1}/${this.maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, this.retryDelayMs));
+              if (
+                chunk.type === 'json_parse_error' &&
+                chunk.threadId &&
+                retryCount < this.maxRetries
+              ) {
+                console.log(
+                  `\n⚠️ JSON parsing error in SSE. Retrying with threadId ${chunk.threadId}... (attempt ${retryCount + 1}/${this.maxRetries})`
+                );
+                await new Promise((resolve) => setTimeout(resolve, this.retryDelayMs));
                 const retryPayload = { ...payload, chat_threads_id: chunk.threadId };
-                yield* this.streamQuery(token, retryPayload, retryCount + 1);
+                yield* this.streamQuery(credential, retryPayload, retryCount + 1);
                 return;
               }
               yield chunk;
@@ -409,12 +461,18 @@ export class PostechClient {
             const chunk = this.parseSSELine(line);
             if (chunk) {
               // JSON parsing error from backend - retry with threadId
-              if (chunk.type === 'json_parse_error' && chunk.threadId && retryCount < this.maxRetries) {
-                console.log(`\n⚠️ JSON parsing error in SSE. Retrying with threadId ${chunk.threadId}... (attempt ${retryCount + 1}/${this.maxRetries})`);
+              if (
+                chunk.type === 'json_parse_error' &&
+                chunk.threadId &&
+                retryCount < this.maxRetries
+              ) {
+                console.log(
+                  `\n⚠️ JSON parsing error in SSE. Retrying with threadId ${chunk.threadId}... (attempt ${retryCount + 1}/${this.maxRetries})`
+                );
                 reader.cancel(); // Close current stream
-                await new Promise(resolve => setTimeout(resolve, this.retryDelayMs));
+                await new Promise((resolve) => setTimeout(resolve, this.retryDelayMs));
                 const retryPayload = { ...payload, chat_threads_id: chunk.threadId };
-                yield* this.streamQuery(token, retryPayload, retryCount + 1);
+                yield* this.streamQuery(credential, retryPayload, retryCount + 1);
                 return;
               }
               yield chunk;
@@ -435,9 +493,7 @@ export class PostechClient {
       // Handle generic fetch errors (network issues, DNS, etc.)
       // Extract cause for detailed error info
       const cause = (error as { cause?: Error }).cause;
-      const causeInfo = cause
-        ? `\nCause: ${cause.name}: ${cause.message}`
-        : '';
+      const causeInfo = cause ? `\nCause: ${cause.name}: ${cause.message}` : '';
       const errorMessage = error instanceof Error ? error.message : String(error);
 
       throw new PostechClientError(
@@ -545,5 +601,163 @@ export class PostechClient {
     }
 
     return payload;
+  }
+
+  /**
+   * Simple query for a2 API endpoints (API key mode).
+   * Uses simpler payload format: { message, stream, files }
+   *
+   * @param apiKey - API key for X-Api-Key header
+   * @param message - The message to send
+   * @param model - Model name ('gemini', 'gpt', 'claude')
+   * @param stream - Whether to stream response (default: false)
+   */
+  async *streamQueryA2(
+    apiKey: string,
+    message: string,
+    model: 'gemini' | 'gpt' | 'claude' = 'gemini',
+    stream: boolean = true
+  ): AsyncGenerator<StreamChunk> {
+    // GPT: a1, Gemini: a2, Claude: a3
+    const apiVersion = model === 'gpt' ? 1 : model === 'gemini' ? 2 : 3;
+    const a2Url = `${this.baseUrl}/agent/api/a${apiVersion}/${model}`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
+
+    const payload = {
+      message,
+      stream,
+      files: [],
+    };
+    const bodyStr = JSON.stringify(payload);
+
+    console.log('\n=== A2 API Request ===');
+    console.log(`URL: ${a2Url}`);
+    console.log(`Model: ${model}`);
+    console.log(`Message: ${message.slice(0, 100)}...`);
+    console.log('======================\n');
+
+    try {
+      const response = await fetch(a2Url, {
+        method: 'POST',
+        headers: {
+          'X-Api-Key': apiKey,
+          'Content-Type': 'application/json',
+          Accept: stream ? 'text/event-stream' : 'application/json',
+        },
+        body: bodyStr,
+        signal: controller.signal,
+      });
+
+      if (response.status === 401) {
+        throw new PostechClientError('Invalid API key', 401);
+      }
+
+      if (!response.ok) {
+        const errorBody = await response.text().catch(() => '');
+        throw new PostechClientError(
+          `A2 API error: ${response.status} ${response.statusText}\n→ URL: ${a2Url}\n→ Body: ${bodyStr}`,
+          response.status,
+          { url: a2Url, headers: { 'X-Api-Key': '...' }, bodyPreview: bodyStr },
+          { status: response.status, statusText: response.statusText, bodyPreview: errorBody }
+        );
+      }
+
+      if (stream && response.body) {
+        // Handle SSE streaming
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+
+          if (done) {
+            if (buffer.trim()) {
+              yield { type: 'text', content: buffer };
+            }
+            break;
+          }
+
+          buffer += decoder.decode(value, { stream: true });
+
+          // Process complete lines
+          while (buffer.includes('\n')) {
+            const newlineIndex = buffer.indexOf('\n');
+            const line = buffer.slice(0, newlineIndex).trim();
+            buffer = buffer.slice(newlineIndex + 1);
+
+            if (line.startsWith('data:')) {
+              const data = line.slice(5).trim();
+              if (data) {
+                try {
+                  const parsed = JSON.parse(data);
+                  if (parsed.replies) {
+                    yield { type: 'text', content: parsed.replies };
+                  }
+                } catch {
+                  // Plain text chunk
+                  yield { type: 'text', content: data };
+                }
+              }
+            }
+          }
+        }
+      } else {
+        // Non-streaming response
+        const data = (await response.json()) as { replies?: string };
+        if (data.replies) {
+          yield { type: 'text', content: data.replies };
+        }
+      }
+
+      yield { type: 'done' };
+    } catch (error) {
+      if (error instanceof Error && error.name === 'AbortError') {
+        throw new PostechClientError('Request timed out');
+      }
+      if (error instanceof PostechClientError) {
+        throw error;
+      }
+      throw new PostechClientError(
+        `Network error: ${error instanceof Error ? error.message : String(error)}`
+      );
+    } finally {
+      clearTimeout(timeoutId);
+    }
+  }
+
+  /**
+   * Simple non-streaming query for a2 API.
+   */
+  async queryA2(
+    apiKey: string,
+    message: string,
+    model: 'gemini' | 'gpt' | 'claude' = 'gemini'
+  ): Promise<string> {
+    const a2Url = `${this.baseUrl}/agent/api/a${model === 'gpt' ? 1 : model === 'gemini' ? 2 : 3}/${model}`;
+
+    const response = await fetch(a2Url, {
+      method: 'POST',
+      headers: {
+        'X-Api-Key': apiKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        message,
+        stream: false,
+        files: [],
+      }),
+    });
+
+    if (!response.ok) {
+      throw new PostechClientError(
+        `A2 API error: ${response.status} ${response.statusText}`,
+        response.status
+      );
+    }
+
+    const data = (await response.json()) as { replies?: string };
+    return data.replies || '';
   }
 }
