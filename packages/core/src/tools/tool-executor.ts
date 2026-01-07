@@ -1379,8 +1379,61 @@ newText: ${newText === '' ? '빈 문자열' : newText === null ? 'null' : '공�
           console.log(`  - INSERT mode: no lines will be deleted`);
         }
 
+        // Check for anchor.expectedText - enables substring replacement
+        const anchor = (edit as { anchor?: { expectedText?: string } }).anchor;
+        const expectedText = anchor?.expectedText;
+
         // Replace/Insert lines
-        const newLines = newText ? newText.trimEnd().split('\n') : [];
+        let newLines: string[];
+
+        if (expectedText && !isInsertMode && deleteCount === 1) {
+          // 부분 문자열 교체 모드 (Substring Replacement Mode)
+          // - anchor.expectedText가 있고
+          // - REPLACE 모드이고
+          // - 단일 라인 교체일 때
+          const originalLine = lines[start];
+
+          if (originalLine.includes(expectedText)) {
+            // expectedText를 newText로 교체 (들여쓰기 등 보존)
+            const replacedLine = originalLine.replace(expectedText, newText);
+            newLines = [replacedLine];
+            console.log(`  - Substring replacement mode:`);
+            console.log(`    - Original: "${originalLine.slice(0, 80)}${originalLine.length > 80 ? '...' : ''}"`);
+            console.log(`    - Expected: "${expectedText.slice(0, 60)}${expectedText.length > 60 ? '...' : ''}"`);
+            console.log(`    - NewText:  "${newText.slice(0, 60)}${newText.length > 60 ? '...' : ''}"`);
+            console.log(`    - Result:   "${replacedLine.slice(0, 80)}${replacedLine.length > 80 ? '...' : ''}"`);
+          } else {
+            // expectedText가 라인에 없음 - 경고 반환
+            return `[ERROR] anchor.expectedText가 라인 ${startLine1}에서 발견되지 않았습니다!
+
+예상 텍스트: "${expectedText.slice(0, 100)}${expectedText.length > 100 ? '...' : ''}"
+실제 라인: "${originalLine.slice(0, 100)}${originalLine.length > 100 ? '...' : ''}"
+
+파일을 다시 읽어서 현재 상태를 확인하세요.`;
+          }
+        } else {
+          // 기존 동작: 전체 라인 교체
+          newLines = newText ? newText.trimEnd().split('\n') : [];
+
+          // 들여쓰기 손실 경고 (단일 라인 교체 시)
+          if (!isInsertMode && deleteCount === 1 && newLines.length === 1) {
+            const originalLine = lines[start];
+            const originalIndent = originalLine.match(/^(\s*)/)?.[1] ?? '';
+            const newIndent = newLines[0].match(/^(\s*)/)?.[1] ?? '';
+
+            if (originalIndent.length > 0 && newIndent.length === 0) {
+              console.log(`  - [WARNING] 들여쓰기 손실 감지!`);
+              console.log(`    - 원본 들여쓰기: ${originalIndent.length}자 (탭 ${originalIndent.split('\t').length - 1}개)`);
+              console.log(`    - 새 들여쓰기: 없음`);
+              console.log(`    - anchor.expectedText를 사용하면 들여쓰기가 보존됩니다.`);
+
+              // 자동 들여쓰기 보존: 원본 들여쓰기를 newText 앞에 추가
+              newLines[0] = originalIndent + newLines[0];
+              console.log(`    - 자동 보정: "${newLines[0].slice(0, 80)}${newLines[0].length > 80 ? '...' : ''}"`);
+            }
+          }
+        }
+
         editRanges.push({ start, end: start + deleteCount, newLineCount: newLines.length });
         lines.splice(start, deleteCount, ...newLines);
 
