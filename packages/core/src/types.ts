@@ -153,6 +153,7 @@ export interface UserInfo {
 
 export interface Session {
   id: string;
+  title?: string;  // 세션 제목 (첫 응답 기반 자동 생성)
   messages: Message[];
   model: string;
   threadId?: number;
@@ -162,6 +163,7 @@ export interface Session {
 
 export interface SessionMetadata {
   id: string;
+  title?: string;
   model: string;
   messageCount: number;
   createdAt: string;

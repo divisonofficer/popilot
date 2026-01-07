@@ -12,6 +12,7 @@ import type { Session, SessionMetadata, Message } from '../types.js';
 export interface SessionServiceConfig {
   sessionsDir?: string;
   maxSessions?: number;
+  autoSave?: boolean;  // Auto-save on message add
 }
 
 /**
@@ -20,11 +21,15 @@ export interface SessionServiceConfig {
 export class SessionService {
   private sessionsDir: string;
   private maxSessions: number;
+  private autoSave: boolean;
   private currentSession: Session | null = null;
+  private saveDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly LAST_SESSION_FILE = 'last-session-id.txt';
 
   constructor(config?: SessionServiceConfig) {
     this.sessionsDir = config?.sessionsDir ?? path.join(os.homedir(), '.popilot', 'sessions');
     this.maxSessions = config?.maxSessions ?? 50;
+    this.autoSave = config?.autoSave ?? true;
 
     // Ensure sessions directory exists
     if (!fs.existsSync(this.sessionsDir)) {
@@ -77,6 +82,54 @@ export class SessionService {
 
     this.currentSession.messages.push(message);
     this.currentSession.updatedAt = new Date();
+
+    // Auto-save with debounce (500ms) to avoid too frequent disk writes
+    if (this.autoSave) {
+      this.debouncedSave();
+    }
+  }
+
+  /**
+   * Debounced save to avoid too frequent disk writes.
+   */
+  private debouncedSave(): void {
+    if (this.saveDebounceTimer) {
+      clearTimeout(this.saveDebounceTimer);
+    }
+    this.saveDebounceTimer = setTimeout(() => {
+      this.saveSessionSync();
+      this.saveDebounceTimer = null;
+    }, 500);
+  }
+
+  /**
+   * Synchronous save for internal use (auto-save).
+   */
+  private saveSessionSync(): void {
+    if (!this.currentSession) return;
+
+    try {
+      const filepath = path.join(this.sessionsDir, `${this.currentSession.id}.json`);
+      const data = JSON.stringify(this.currentSession, null, 2);
+      fs.writeFileSync(filepath, data, 'utf-8');
+
+      // Update last session ID
+      const lastSessionPath = path.join(this.sessionsDir, SessionService.LAST_SESSION_FILE);
+      fs.writeFileSync(lastSessionPath, this.currentSession.id, 'utf-8');
+    } catch (error) {
+      console.error('Auto-save failed:', error);
+    }
+  }
+
+  /**
+   * Force immediate save (for shutdown).
+   */
+  flushSave(): void {
+    if (this.saveDebounceTimer) {
+      clearTimeout(this.saveDebounceTimer);
+      this.saveDebounceTimer = null;
+    }
+    this.saveSessionSync();
   }
 
   /**
@@ -88,6 +141,50 @@ export class SessionService {
     }
 
     this.currentSession.threadId = threadId;
+  }
+
+  /**
+   * Set session title.
+   */
+  setTitle(title: string): void {
+    if (!this.currentSession) {
+      throw new Error('No active session');
+    }
+
+    this.currentSession.title = title;
+    // Trigger save after title update
+    if (this.autoSave) {
+      this.debouncedSave();
+    }
+  }
+
+  /**
+   * Get current session title.
+   */
+  getTitle(): string | undefined {
+    return this.currentSession?.title;
+  }
+
+  /**
+   * Generate session title from first user message.
+   * Takes first 30 chars of first user message as title.
+   */
+  generateTitleFromFirstMessage(): string | null {
+    if (!this.currentSession || this.currentSession.title) {
+      return this.currentSession?.title ?? null;
+    }
+
+    const firstUserMsg = this.currentSession.messages.find(m => m.role === 'user');
+    if (!firstUserMsg) return null;
+
+    const content = typeof firstUserMsg.content === 'string'
+      ? firstUserMsg.content
+      : firstUserMsg.content.map(p => p.text ?? '').join(' ');
+
+    // Take first 30 chars, trim, add ellipsis if truncated
+    const title = content.slice(0, 30).trim() + (content.length > 30 ? '...' : '');
+    this.setTitle(title);
+    return title;
   }
 
   /**
@@ -133,6 +230,51 @@ export class SessionService {
   }
 
   /**
+   * Load the most recently saved session (for startup restoration).
+   * Returns null if no previous session exists.
+   */
+  loadLastSession(): Session | null {
+    const lastSessionPath = path.join(this.sessionsDir, SessionService.LAST_SESSION_FILE);
+
+    try {
+      // Read last session ID
+      const lastSessionId = fs.readFileSync(lastSessionPath, 'utf-8').trim();
+      if (!lastSessionId) return null;
+
+      // Load the session file
+      const filepath = path.join(this.sessionsDir, `${lastSessionId}.json`);
+      const data = fs.readFileSync(filepath, 'utf-8');
+      const session = JSON.parse(data) as Session;
+
+      // Convert date strings back to Date objects
+      session.createdAt = new Date(session.createdAt);
+      session.updatedAt = new Date(session.updatedAt);
+
+      this.currentSession = session;
+      return session;
+    } catch {
+      // No previous session or file not found
+      return null;
+    }
+  }
+
+  /**
+   * Check if there's a previous session to restore.
+   */
+  hasLastSession(): boolean {
+    const lastSessionPath = path.join(this.sessionsDir, SessionService.LAST_SESSION_FILE);
+    try {
+      const lastSessionId = fs.readFileSync(lastSessionPath, 'utf-8').trim();
+      if (!lastSessionId) return false;
+
+      const filepath = path.join(this.sessionsDir, `${lastSessionId}.json`);
+      return fs.existsSync(filepath);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * List all saved sessions.
    */
   async listSessions(): Promise<SessionMetadata[]> {
@@ -149,6 +291,7 @@ export class SessionService {
 
         sessions.push({
           id: session.id,
+          title: session.title,
           model: session.model,
           messageCount: session.messages.length,
           createdAt: session.createdAt.toString(),

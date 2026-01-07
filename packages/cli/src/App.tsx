@@ -320,8 +320,31 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
   // State
   const [state, setState] = useState<AppState>('idle');
   const [messages, setMessages] = useState<Message[]>([]);
+  const [sessionTitle, setSessionTitle] = useState<string | undefined>(undefined);
   const [currentResponse, setCurrentResponse] = useState('');
   const [error, setError] = useState<string | null>(null);
+
+  // Throttled response update - 50ms 간격으로 UI 업데이트 (스크롤 부드럽게)
+  const pendingResponseRef = useRef<string>('');
+  const responseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const throttledSetCurrentResponse = useCallback((value: string) => {
+    pendingResponseRef.current = value;
+    if (!responseTimerRef.current) {
+      responseTimerRef.current = setTimeout(() => {
+        setCurrentResponse(pendingResponseRef.current);
+        responseTimerRef.current = null;
+      }, 50);
+    }
+  }, []);
+  // Immediate update (for final values)
+  const flushCurrentResponse = useCallback((value: string) => {
+    if (responseTimerRef.current) {
+      clearTimeout(responseTimerRef.current);
+      responseTimerRef.current = null;
+    }
+    pendingResponseRef.current = value;
+    setCurrentResponse(value);
+  }, []);
   const [currentModel, setCurrentModel] = useState(model);
   const [pendingToolCall, setPendingToolCall] = useState<{ name: string; args: Record<string, unknown> } | null>(null);
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -357,6 +380,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
   }, [autoConfirmSettings]);
   const [authMode, setAuthMode] = useState<AuthMode>('apikey');
   const [ssoToken, setSsoToken] = useState<string | null>(null);  // SSO token for file uploads
+  const [ssoStatus, setSsoStatus] = useState<'idle' | 'authenticating' | 'success' | 'failed'>('idle');
   // Use ref for file attachments - useState is async and won't update in same iteration
   const pendingFileAttachmentsRef = useRef<FileAttachment[]>([]);
 
@@ -396,6 +420,14 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     const tokenManager = new TokenManager({
       storage: tokenStorage,
       authenticator,
+      onAuthStart: () => {
+        setSsoStatus('authenticating');
+      },
+      onAuthComplete: (success: boolean, _error?: string) => {
+        setSsoStatus(success ? 'success' : 'failed');
+        // Reset to idle after 3 seconds
+        setTimeout(() => setSsoStatus('idle'), 3000);
+      },
     });
 
     // API Key authentication
@@ -441,10 +473,21 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     // Check authentication status on startup
     setIsAuthenticated(tokenManager.hasValidToken());
 
+    // Restore last session if available
+    const lastSession = sessionService.loadLastSession();
+    if (lastSession && lastSession.messages.length > 0) {
+      setMessages(lastSession.messages);
+      setCurrentModel(lastSession.model);
+      setSessionTitle(lastSession.title);
+      console.log(`📂 이전 세션 복원됨: ${lastSession.title ?? '(무제)'} (${lastSession.messages.length}개 메시지)`);
+    }
+
     // Set raw mode for input handling
     setRawMode(true);
 
     return () => {
+      // Flush any pending saves before shutdown
+      sessionService.flushSave();
       setRawMode(false);
     };
   }, [workingDir, setRawMode]);
@@ -549,8 +592,14 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     setMessages((prev) => [...prev, userMessage]);
     sessionService.addMessage(userMessage);
 
+    // Generate session title from first user message
+    const generatedTitle = sessionService.generateTitleFromFirstMessage();
+    if (generatedTitle) {
+      setSessionTitle(generatedTitle);
+    }
+
     setState('streaming');
-    setCurrentResponse('');
+    flushCurrentResponse('');
     setError(null);
 
     // Determine credential and API mode
@@ -637,7 +686,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
               // No SSO token available - warn and skip file uploads
               console.log('⚠️ SSO 토큰 없음 - 파일 첨부 건너뜀');
               fullDisplayResponse += '[!] 파일 첨부를 위해 SSO 인증이 필요합니다. /sso로 로그인해주세요.\n';
-              setCurrentResponse(fullDisplayResponse);
+              flushCurrentResponse(fullDisplayResponse);
             }
           }
 
@@ -656,7 +705,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             } catch (uploadError) {
               console.error('파일 업로드 실패:', uploadError);
               fullDisplayResponse += `[!] 파일 업로드 실패: ${uploadError instanceof Error ? uploadError.message : String(uploadError)}\n`;
-              setCurrentResponse(fullDisplayResponse);
+              flushCurrentResponse(fullDisplayResponse);
             }
           }
         }
@@ -674,7 +723,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             if (chunk.type === 'text' && chunk.content) {
               rawResponse = chunk.content; // A2 returns full response, not incremental
               const displayText = filterOutput(rawResponse);
-              setCurrentResponse(fullDisplayResponse + displayText);
+              throttledSetCurrentResponse(fullDisplayResponse + displayText);
             }
           }
         } else {
@@ -691,7 +740,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             if (chunk.type === 'text' && chunk.content) {
               rawResponse += chunk.content;
               const displayText = filterOutput(rawResponse);
-              setCurrentResponse(fullDisplayResponse + displayText);
+              throttledSetCurrentResponse(fullDisplayResponse + displayText);
             }
             // Save threadId for SSO mode
             if (chunk.threadId && !sessionService.getCurrentSession(currentModel).threadId) {
@@ -716,7 +765,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
           if (errorRetryCount >= MAX_ERROR_RETRIES) {
             // Max retries reached - show error and break
             fullDisplayResponse += `\n[x] API 오류가 계속 발생합니다. 대화를 새로 시작해주세요.\n`;
-            setCurrentResponse(fullDisplayResponse);
+            flushCurrentResponse(fullDisplayResponse);
             const errorMessage: Message = {
               role: 'assistant',
               content: '[API 오류로 인해 요청을 처리할 수 없습니다. /clear로 대화를 초기화해주세요.]',
@@ -726,7 +775,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
           }
 
           fullDisplayResponse += `\n[!] API 오류 발생, 재시도 중... (${errorRetryCount}/${MAX_ERROR_RETRIES})\n`;
-          setCurrentResponse(fullDisplayResponse);
+          flushCurrentResponse(fullDisplayResponse);
           // Wait a bit and retry this iteration
           await new Promise(resolve => setTimeout(resolve, 2000));
           continue;
@@ -740,7 +789,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
           logger.logIteration(iteration, 'aborted', 'empty_response');
           logger.logError(iteration, 'Empty response received from API');
           fullDisplayResponse += '\n[!] 빈 응답을 받았습니다. 재시도 중...\n';
-          setCurrentResponse(fullDisplayResponse);
+          flushCurrentResponse(fullDisplayResponse);
           await new Promise(resolve => setTimeout(resolve, 1000));
           continue;
         }
@@ -758,7 +807,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
           logger.logIteration(iteration, 'aborted', 'malformed_tool_response');
           logger.logError(iteration, `Malformed tool response: ${rawResponse.slice(0, 200)}`);
           fullDisplayResponse += '\n[!] 불완전한 도구 응답. 재시도 중...\n';
-          setCurrentResponse(fullDisplayResponse);
+          flushCurrentResponse(fullDisplayResponse);
           await new Promise(resolve => setTimeout(resolve, 1000));
           continue;
         }
@@ -783,7 +832,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
               // Log and show unsupported tool
               logger.logError(iteration, `Unsupported tool: ${toolCall.toolName}`);
               fullDisplayResponse += `⚠️ 미지원 도구: ${toolCall.toolName}\n`;
-              setCurrentResponse(fullDisplayResponse);
+              flushCurrentResponse(fullDisplayResponse);
 
               // Add skip message for unsupported tools
               const skipMessage: Message = {
@@ -833,7 +882,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             // Add summarized output to display response
             const summary = summarizeToolOutput(toolCall.toolName, toolCall.args, result.result);
             fullDisplayResponse += summary + '\n';
-            setCurrentResponse(fullDisplayResponse);
+            flushCurrentResponse(fullDisplayResponse);
 
             // Add full tool result to conversation for model context
             const toolResultMessage: Message = {
@@ -853,7 +902,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
           loopEndReason = 'completed';
 
           fullDisplayResponse += filterOutput(cleanResponse);
-          setCurrentResponse(fullDisplayResponse);
+          flushCurrentResponse(fullDisplayResponse);
 
           // Add final assistant message (sanitize backticks for API compatibility)
           const assistantMessage: Message = { role: 'assistant', content: sanitizeBackticks(fullDisplayResponse) };
@@ -867,7 +916,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       if (iteration >= MAX_AGENT_ITERATIONS) {
         loopEndReason = 'max_iterations';
         fullDisplayResponse += '\n\n[!] 최대 반복 횟수에 도달했습니다.';
-        setCurrentResponse(fullDisplayResponse);
+        flushCurrentResponse(fullDisplayResponse);
         const assistantMessage: Message = { role: 'assistant', content: sanitizeBackticks(fullDisplayResponse) };
         setMessages((prev) => [...prev, assistantMessage]);
         sessionService.addMessage(assistantMessage);
@@ -905,7 +954,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         logger.logLoopEnd('unexpected', iteration, 'Loop terminated without proper completion');
       }
       setState('idle');
-      setCurrentResponse('');
+      flushCurrentResponse('');
       setCurrentTool(null);
     }
   }, [state, messages, currentModel, initializeChatRoom, shouldAutoConfirm]);
@@ -937,7 +986,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
     // Reset state
     setState('idle');
-    setCurrentResponse('');
+    flushCurrentResponse('');
     setCurrentTool(null);
     pendingLoopStateRef.current = null;
     currentResponseRef.current = '';
@@ -975,10 +1024,14 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
       case 'clear':
         setMessages([]);
+        setSessionTitle(undefined);
+        // Clear current session and create a new one
         servicesRef.current?.sessionService.clearCurrentSession();
+        // Force create a new session with new ID
+        servicesRef.current?.sessionService.createSession(currentModel);
         setMessages((prev) => [...prev, {
           role: 'assistant',
-          content: '[SYSTEM] 대화가 초기화되었습니다. (Thread ID 리셋)',
+          content: '[SYSTEM] 새 세션이 시작되었습니다.',
         }]);
         break;
 
@@ -1350,7 +1403,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
       // Add summarized output to display response
       const summary = summarizeToolOutput(pendingToolCall.name, pendingToolCall.args, result.result);
       loopState.fullDisplayResponse += summary + '\n';
-      setCurrentResponse(loopState.fullDisplayResponse);
+      flushCurrentResponse(loopState.fullDisplayResponse);
 
       // Add full tool result to conversation for model context
       const toolResultMessage: Message = {
@@ -1368,7 +1421,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
       };
       loopState.conversationMessages.push(skipMessage);
       loopState.fullDisplayResponse += `⛔ ${pendingToolCall.name} 실행 취소됨\n`;
-      setCurrentResponse(loopState.fullDisplayResponse);
+      flushCurrentResponse(loopState.fullDisplayResponse);
     }
 
     // Move to next tool
@@ -1384,7 +1437,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
     if (key.ctrl && input === 'c') {
       if (state === 'streaming') {
         setState('idle');
-        setCurrentResponse('');
+        flushCurrentResponse('');
       } else {
         exit();
       }
@@ -1443,7 +1496,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
           // Log and show unsupported tool
           logger.logError(iteration, `Unsupported tool: ${toolCall.toolName}`);
           fullDisplayResponse += `⚠️ 미지원 도구: ${toolCall.toolName}\n`;
-          setCurrentResponse(fullDisplayResponse);
+          flushCurrentResponse(fullDisplayResponse);
 
           const skipMessage: Message = {
             role: 'tool',
@@ -1487,7 +1540,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
         // Add summarized output to display response
         const summary = summarizeToolOutput(toolCall.toolName, toolCall.args, result.result);
         fullDisplayResponse += summary + '\n';
-        setCurrentResponse(fullDisplayResponse);
+        flushCurrentResponse(fullDisplayResponse);
 
         // Add full tool result to conversation for model context
         const toolResultMessage: Message = {
@@ -1565,7 +1618,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
             if (chunk.type === 'text' && chunk.content) {
               rawResponse = chunk.content;
               const displayText = filterOutput(rawResponse);
-              setCurrentResponse(fullDisplayResponse + displayText);
+              throttledSetCurrentResponse(fullDisplayResponse + displayText);
             }
           }
         } else {
@@ -1582,7 +1635,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
             if (chunk.type === 'text' && chunk.content) {
               rawResponse += chunk.content;
               const displayText = filterOutput(rawResponse);
-              setCurrentResponse(fullDisplayResponse + displayText);
+              throttledSetCurrentResponse(fullDisplayResponse + displayText);
             }
             if (chunk.threadId && !sessionService.getCurrentSession(currentModel).threadId) {
               sessionService.setThreadId(chunk.threadId);
@@ -1600,7 +1653,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
 
         if (isErrorResponse) {
           fullDisplayResponse += `\n[!] API 오류 발생. 대화를 새로 시작해주세요.\n`;
-          setCurrentResponse(fullDisplayResponse);
+          flushCurrentResponse(fullDisplayResponse);
           break;
         }
 
@@ -1627,7 +1680,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
               // Log and show unsupported tool
               logger.logError(iteration, `Unsupported tool: ${toolCall.toolName}`);
               fullDisplayResponse += `⚠️ 미지원 도구: ${toolCall.toolName}\n`;
-              setCurrentResponse(fullDisplayResponse);
+              flushCurrentResponse(fullDisplayResponse);
 
               const skipMessage: Message = {
                 role: 'tool',
@@ -1676,7 +1729,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
             // Add summarized output
             const summary = summarizeToolOutput(toolCall.toolName, toolCall.args, result.result);
             fullDisplayResponse += summary + '\n';
-            setCurrentResponse(fullDisplayResponse);
+            flushCurrentResponse(fullDisplayResponse);
 
             // Add tool result to conversation
             const toolResultMessage: Message = {
@@ -1693,7 +1746,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
         } else {
           // No more tool calls - we're done
           fullDisplayResponse += filterOutput(cleanResponse);
-          setCurrentResponse(fullDisplayResponse);
+          flushCurrentResponse(fullDisplayResponse);
 
           // Add final assistant message (sanitize backticks for API compatibility)
           const assistantMessage: Message = { role: 'assistant', content: sanitizeBackticks(fullDisplayResponse) };
@@ -1706,7 +1759,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
 
       if (iteration >= MAX_AGENT_ITERATIONS) {
         fullDisplayResponse += '\n\n[!] 최대 반복 횟수에 도달했습니다.';
-        setCurrentResponse(fullDisplayResponse);
+        flushCurrentResponse(fullDisplayResponse);
         const assistantMessage: Message = { role: 'assistant', content: sanitizeBackticks(fullDisplayResponse) };
         setMessages((prev) => [...prev, assistantMessage]);
         sessionService.addMessage(assistantMessage);
@@ -1723,7 +1776,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
         return;
       }
       setState('idle');
-      setCurrentResponse('');
+      flushCurrentResponse('');
       setCurrentTool(null);
       pendingLoopStateRef.current = null;
     }
@@ -1743,6 +1796,23 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
   return (
     <Box flexDirection="column" padding={1}>
       <Header model={currentModel} workingDir={workingDir} />
+
+      {/* SSO 인증 상태 표시 */}
+      {ssoStatus === 'authenticating' && (
+        <Box marginY={1} paddingX={1}>
+          <Text color="yellow">🔐 SSO 인증 요청 중... 브라우저에서 로그인해주세요</Text>
+        </Box>
+      )}
+      {ssoStatus === 'success' && (
+        <Box marginY={1} paddingX={1}>
+          <Text color="green">✅ SSO 인증 완료</Text>
+        </Box>
+      )}
+      {ssoStatus === 'failed' && (
+        <Box marginY={1} paddingX={1}>
+          <Text color="red">❌ SSO 인증 실패</Text>
+        </Box>
+      )}
 
       <Box flexDirection="column" flexGrow={1} marginY={1}>
         <ChatView
@@ -1774,7 +1844,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
         />
       )}
 
-      <Footer state={state} model={currentModel} isAuthenticated={isAuthenticated} initializingChat={initializingChat} currentTool={currentTool ?? undefined} threadId={servicesRef.current?.sessionService.getCurrentSession(currentModel).threadId} />
+      <Footer state={state} model={currentModel} isAuthenticated={isAuthenticated} initializingChat={initializingChat} currentTool={currentTool ?? undefined} threadId={servicesRef.current?.sessionService.getCurrentSession(currentModel).threadId} sessionTitle={sessionTitle} messageCount={messages.length} />
     </Box>
   );
 }

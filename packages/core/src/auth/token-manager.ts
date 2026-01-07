@@ -14,6 +14,10 @@ export interface TokenManagerConfig {
   storage: TokenStorage;
   authenticator: SSOAuthenticator;
   expiryBufferSeconds?: number;
+  /** Called when SSO authentication starts */
+  onAuthStart?: () => void;
+  /** Called when SSO authentication completes (success or fail) */
+  onAuthComplete?: (success: boolean, error?: string) => void;
 }
 
 /**
@@ -23,6 +27,8 @@ export class TokenManager {
   private storage: TokenStorage;
   private authenticator: SSOAuthenticator;
   private expiryBufferSeconds: number;
+  private onAuthStart?: () => void;
+  private onAuthComplete?: (success: boolean, error?: string) => void;
 
   private token: string | null = null;
   private refreshToken: string | null = null;
@@ -33,6 +39,8 @@ export class TokenManager {
     this.storage = config.storage;
     this.authenticator = config.authenticator;
     this.expiryBufferSeconds = config.expiryBufferSeconds ?? 300;
+    this.onAuthStart = config.onAuthStart;
+    this.onAuthComplete = config.onAuthComplete;
 
     // Try to load existing token
     this.loadStoredToken();
@@ -123,17 +131,25 @@ export class TokenManager {
     this.authInProgress = (async () => {
       try {
         console.log('Starting SSO re-authentication...');
+        // Notify UI that auth is starting
+        this.onAuthStart?.();
+
         const tokens = await this.authenticator.authenticate();
 
         this.setToken(tokens.accessToken, tokens.refreshToken);
         this.storage.saveTokens(tokens.accessToken, tokens.refreshToken);
 
         console.log('Re-authentication successful');
+        // Notify UI that auth completed successfully
+        this.onAuthComplete?.(true);
         return tokens.accessToken;
       } catch (error) {
+        const errorMsg = error instanceof Error ? error.message : String(error);
         if (error instanceof AuthenticationError) {
           console.error(`Re-authentication failed: ${error.message}`);
         }
+        // Notify UI that auth failed
+        this.onAuthComplete?.(false, errorMsg);
         throw error;
       } finally {
         this.authInProgress = null;

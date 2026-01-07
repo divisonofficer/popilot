@@ -50,6 +50,7 @@ export interface InputPromptProps {
 export function InputPrompt({ onSubmit, disabled = false, placeholder }: InputPromptProps) {
   const [value, setValue] = useState('');
   const [completionIndex, setCompletionIndex] = useState(0);
+  const [inputKey, setInputKey] = useState(0);  // 탭 완성 시 커서 위치 리셋용
 
   // Get completion candidates based on current input
   const completionCandidates = useMemo(() => {
@@ -89,6 +90,8 @@ export function InputPrompt({ onSubmit, disabled = false, placeholder }: InputPr
       const candidate = completionCandidates[completionIndex % completionCandidates.length];
       setValue(candidate + ' ');
       setCompletionIndex((prev) => (prev + 1) % completionCandidates.length);
+      // inputKey 변경으로 TextInput 리렌더 → 커서가 끝으로 이동
+      setInputKey((prev) => prev + 1);
     }
   });
 
@@ -116,6 +119,7 @@ export function InputPrompt({ onSubmit, disabled = false, placeholder }: InputPr
       >
         <Text color={disabled ? 'gray' : POSTECH_RED}>❯ </Text>
         <TextInput
+          key={inputKey}
           value={value}
           onChange={handleChange}
           onSubmit={handleSubmit}

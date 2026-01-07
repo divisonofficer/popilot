@@ -15,9 +15,11 @@ export interface FooterProps {
   initializingChat?: boolean;
   currentTool?: string;
   threadId?: number;
+  sessionTitle?: string;
+  messageCount?: number;
 }
 
-export function Footer({ state, model, isAuthenticated = true, initializingChat = false, currentTool, threadId }: FooterProps) {
+export function Footer({ state, model, isAuthenticated = true, initializingChat = false, currentTool, threadId, sessionTitle, messageCount }: FooterProps) {
   const getStatusText = () => {
     if (initializingChat) {
       return '채팅방 초기화 중...';
@@ -51,6 +53,11 @@ export function Footer({ state, model, isAuthenticated = true, initializingChat 
     return modelMap[model] || model;
   };
 
+  // Truncate session title for display
+  const displayTitle = sessionTitle
+    ? (sessionTitle.length > 25 ? sessionTitle.slice(0, 25) + '...' : sessionTitle)
+    : undefined;
+
   return (
     <Box marginTop={1} justifyContent="space-between">
       <Box>
@@ -58,18 +65,21 @@ export function Footer({ state, model, isAuthenticated = true, initializingChat 
         <Text color={getStatusColor()}>
           {getStatusText()}
         </Text>
-        <Text color="gray"> | Model: </Text>
+        <Text color="gray"> | </Text>
         <Text color={POSTECH_YELLOW}>{getShortModelName()}</Text>
-        {threadId && (
+        {displayTitle && (
           <>
-            <Text color="gray"> | Thread: </Text>
-            <Text color="cyan">#{threadId}</Text>
+            <Text color="gray"> | </Text>
+            <Text color="white">{displayTitle}</Text>
           </>
+        )}
+        {messageCount !== undefined && messageCount > 0 && (
+          <Text color="gray"> ({messageCount})</Text>
         )}
       </Box>
       <Box>
         <Text color="gray">
-          Ctrl+C: {state === 'streaming' ? '취소' : '종료'} | /help: 도움말
+          Ctrl+C: {state === 'streaming' ? '취소' : '종료'} | /help
         </Text>
       </Box>
     </Box>
