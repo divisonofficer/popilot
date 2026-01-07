@@ -6,7 +6,7 @@
  */
 
 import type { Message, ContentPart, FileAttachment } from '../types.js';
-import { contentToDataUrl } from '../types.js';
+import { getMimeType } from './file-uploader.js';
 
 // Default configuration constants
 // A2 API has more generous limits AND no thread/history, so we keep more context
@@ -599,12 +599,13 @@ export class RequestTransformer {
         actualContent = actualContent.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"');
       }
 
-      // Create file attachment
-      const fileId = `file_${++this.fileIdCounter}`;
+      // Create file attachment with pending content for upload
+      const fileId = `pending_${++this.fileIdCounter}_${Date.now()}`;
       const attachment: FileAttachment = {
         id: fileId,
         name: filename,
-        url: contentToDataUrl(actualContent, filename),
+        _pendingContent: actualContent,
+        _pendingMimeType: getMimeType(filename),
       };
       this.fileAttachments.push(attachment);
 
@@ -636,11 +637,12 @@ Use SHA256 above for file.applyTextEdits when modifying this file.`;
     if (isFileRead) {
       // Try to extract any content we can
       const genericFilename = 'file_content.txt';
-      const fileId = `file_${++this.fileIdCounter}`;
+      const fileId = `pending_${++this.fileIdCounter}_${Date.now()}`;
       const attachment: FileAttachment = {
         id: fileId,
         name: genericFilename,
-        url: contentToDataUrl(content, genericFilename),
+        _pendingContent: content,
+        _pendingMimeType: 'text/plain',
       };
       this.fileAttachments.push(attachment);
 
@@ -662,7 +664,7 @@ You have access to the FULL content - do NOT summarize or truncate.`;
 
   /**
    * Sanitize text for API.
-   * Removes control characters but preserves backticks for tool format.
+   * Removes control characters and replaces backticks with Unicode lookalike.
    */
   private sanitizeText(text: string): string {
     // Normalize line endings
@@ -671,8 +673,11 @@ You have access to the FULL content - do NOT summarize or truncate.`;
     // Remove control characters except newline and tab
     result = result.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
 
-    // NOTE: We use [CODE]tool format instead of backticks to avoid JSON parsing issues with A2 API
-    // The ToolParser supports both formats: [CODE]tool and ```tool
+    // Replace backticks with Unicode lookalike to avoid A2 API parsing issues
+    // ` (U+0060 GRAVE ACCENT) → ‵ (U+2035 REVERSED PRIME)
+    // This preserves visual appearance and model understanding while avoiding API errors
+    // Works for both inline code (`App.tsx`) and code blocks (```typescript)
+    result = result.replace(/`/g, '\u2035');
 
     return result;
   }

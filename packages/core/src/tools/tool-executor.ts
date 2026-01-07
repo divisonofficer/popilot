@@ -10,7 +10,7 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { spawn, execSync } from 'node:child_process';
 import type { ToolDefinition, ToolResult, FileAttachment } from '../types.js';
-import { contentToDataUrl } from '../types.js';
+import { getMimeType } from '../client/file-uploader.js';
 
 // Threshold for file attachment (chars) - files larger than this get uploaded
 const FILE_ATTACHMENT_THRESHOLD = 2000;
@@ -267,17 +267,16 @@ export class ToolExecutor {
 
       // Check if file is large enough to warrant attachment
       if (content.length >= FILE_ATTACHMENT_THRESHOLD) {
-        // Large file: create attachment and return metadata
-        const fileId = `file_${Date.now()}`;
-        const fileAttachment: FileAttachment = {
-          id: fileId,
-          name: filename,
-          url: contentToDataUrl(content, filename),
-        };
-
+        // Large file: create attachment with pending content for upload
         // Include line numbers in the content for the attachment
         const numberedContent = lines.map((line, i) => `${String(i + 1).padStart(String(lines.length).length, ' ')}| ${line}`).join('\n');
-        fileAttachment.url = contentToDataUrl(numberedContent, filename);
+
+        const fileAttachment: FileAttachment = {
+          id: `pending_${Date.now()}`,  // Temporary ID, will be replaced after upload
+          name: filename,
+          _pendingContent: numberedContent,  // Raw content to be uploaded
+          _pendingMimeType: getMimeType(filename),
+        };
 
         const result = `${correctionNote}[file.read SUCCESS] ${filepath}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

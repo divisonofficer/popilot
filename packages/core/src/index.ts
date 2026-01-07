@@ -15,6 +15,14 @@ export {
   type AuthMode,
 } from './client/postech-client.js';
 export { RequestTransformer, type TransformerConfig, type TransformerResult } from './client/request-transformer.js';
+export {
+  FileUploader,
+  FileUploadError,
+  getMimeType,
+  type UploadedFile,
+  type FileUploadRequest,
+  type FileUploaderConfig,
+} from './client/file-uploader.js';
 
 // Authentication
 export {

@@ -46,6 +46,35 @@ export class DebugLogger {
   }
 
   /**
+   * Log A2 API request (simpler format)
+   */
+  logA2Request(iteration: number, message: string, model: string, files: unknown[]): void {
+    if (!this.enabled) return;
+
+    const logPath = this.getLogPath('a2_request', iteration);
+    const payload = {
+      model,
+      message_length: message.length,
+      message_preview: message.slice(0, 500) + (message.length > 500 ? '...' : ''),
+      files_count: files.length,
+      files: files.map((f: unknown) => {
+        const file = f as { id?: string; name?: string; url?: string };
+        return {
+          id: file.id,
+          name: file.name,
+          url_length: file.url?.length ?? 0,
+          url_preview: file.url?.slice(0, 100) + '...',
+        };
+      }),
+      full_message: message,
+      timestamp: new Date().toISOString(),
+    };
+    const content = JSON.stringify(payload, null, 2);
+    fs.writeFileSync(logPath, content, 'utf-8');
+    console.log(`📝 A2 Request logged: ${logPath} (${files.length} files attached)`);
+  }
+
+  /**
    * Log raw API response
    */
   logResponse(iteration: number, rawResponse: string): void {

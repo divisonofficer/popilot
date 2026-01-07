@@ -245,15 +245,21 @@ export const DEFAULT_CONFIG: PopilotConfig = {
 
 /**
  * File attachment for A2 API.
- * Files are sent separately from the main prompt.
+ * Files are uploaded via SSO file API, then referenced by ID in A2 API.
  */
 export interface FileAttachment {
-  /** Unique identifier for the file */
+  /** Unique identifier for the file (server-assigned after upload) */
   id: string;
   /** Display name for the file */
   name: string;
-  /** Base64 data URL or actual URL */
-  url: string;
+  /** Base64 data URL (deprecated - use _pendingContent for upload) */
+  url?: string;
+
+  // Upload-related fields (for pending uploads)
+  /** Raw file content to be uploaded (removed after upload) */
+  _pendingContent?: string;
+  /** MIME type for upload */
+  _pendingMimeType?: string;
 }
 
 /**

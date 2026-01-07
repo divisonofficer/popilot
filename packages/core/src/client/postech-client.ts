@@ -666,14 +666,14 @@ export class PostechClient {
    * @param message - The message to send
    * @param model - Model name ('gemini', 'gpt', 'claude')
    * @param stream - Whether to stream response (default: false)
-   * @param files - Optional file attachments (extracted from file.read results)
+   * @param files - Optional file attachments with { id, name, url } (url is required by A2 API)
    */
   async *streamQueryA2(
     apiKey: string,
     message: string,
     model: 'gemini' | 'gpt' | 'claude' = 'gemini',
     stream: boolean = true,
-    files: FileAttachment[] = []
+    files: Array<{ id: string; name: string; url: string }> = []
   ): AsyncGenerator<StreamChunk> {
     // GPT: a1, Gemini: a2, Claude: a3
     const apiVersion = model === 'gpt' ? 1 : model === 'gemini' ? 2 : 3;

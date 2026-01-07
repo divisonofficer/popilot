@@ -17,6 +17,7 @@ import {
   ToolExecutor,
   ToolParser,
   DebugLogger,
+  FileUploader,
   AVAILABLE_MODELS,
   MODEL_ALIASES,
   resolveModelName,
@@ -26,6 +27,7 @@ import {
   type TransformerConfig,
   type AuthMode,
   type FileAttachment,
+  type UploadedFile,
 } from '@popilot/core';
 import { Header } from './ui/Header.js';
 import { ChatView } from './ui/ChatView.js';
@@ -199,6 +201,14 @@ function formatToolDisplay(toolName: string, args: Record<string, unknown>): str
   }
 }
 
+/**
+ * Sanitize backticks in text to avoid A2 API parsing issues.
+ * Replaces ` (U+0060) with ‵ (U+2035 REVERSED PRIME) - visually similar but API-safe.
+ */
+function sanitizeBackticks(text: string): string {
+  return text.replace(/`/g, '\u2035');
+}
+
 export function App({ model, workingDir, transformerConfig }: AppProps) {
   const { exit } = useApp();
   const { setRawMode } = useStdin();
@@ -216,10 +226,35 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
   const [initializingChat, setInitializingChat] = useState(false);
   const [currentTool, setCurrentTool] = useState<string | null>(null);
   const [pendingRetry, setPendingRetry] = useState<string | null>(null);
-  const [autoConfirm, setAutoConfirm] = useState(false);
+  // Per-tool autoconfirm settings (supports patterns like 'file.*')
+  const [autoConfirmSettings, setAutoConfirmSettings] = useState<Record<string, boolean>>({});
   const [pendingResume, setPendingResume] = useState(false);
+
+  // Check if a tool should be auto-confirmed
+  const shouldAutoConfirm = useCallback((toolName: string): boolean => {
+    // Exact match first
+    if (autoConfirmSettings[toolName] !== undefined) {
+      return autoConfirmSettings[toolName];
+    }
+    // Pattern match (e.g., 'file.*' matches 'file.read', 'file.applyTextEdits')
+    for (const pattern of Object.keys(autoConfirmSettings)) {
+      if (pattern.endsWith('.*')) {
+        const prefix = pattern.slice(0, -1); // 'file.' from 'file.*'
+        if (toolName.startsWith(prefix)) {
+          return autoConfirmSettings[pattern];
+        }
+      }
+    }
+    // Global 'all' setting
+    if (autoConfirmSettings['all'] !== undefined) {
+      return autoConfirmSettings['all'];
+    }
+    return false;
+  }, [autoConfirmSettings]);
   const [authMode, setAuthMode] = useState<AuthMode>('apikey');
-  const [pendingFileAttachments, setPendingFileAttachments] = useState<FileAttachment[]>([]);
+  const [ssoToken, setSsoToken] = useState<string | null>(null);  // SSO token for file uploads
+  // Use ref for file attachments - useState is async and won't update in same iteration
+  const pendingFileAttachmentsRef = useRef<FileAttachment[]>([]);
 
   // Refs for services (initialized once)
   const servicesRef = useRef<{
@@ -231,6 +266,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     toolExecutor: ToolExecutor;
     transformer: RequestTransformer;
     logger: DebugLogger;
+    fileUploader: FileUploader;
   } | null>(null);
 
   // Ref for pending loop state during tool confirmation
@@ -268,6 +304,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       modelProvider: initialModelConfig?.provider ?? 'anthropic',
     });
     const logger = new DebugLogger(workingDir, true);
+    const fileUploader = new FileUploader();
 
     console.log(`📁 Debug logs: ${logger.getLogDir()}`);
 
@@ -284,6 +321,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       toolExecutor,
       transformer,
       logger,
+      fileUploader,
     };
 
     // Check authentication status on startup
@@ -387,7 +425,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       return;
     }
 
-    const { client, tokenManager, apiKeyAuthenticator, sessionService, transformer, toolExecutor, logger } = servicesRef.current;
+    const { client, tokenManager, apiKeyAuthenticator, sessionService, transformer, toolExecutor, logger, fileUploader } = servicesRef.current;
 
     // Ensure session exists
     sessionService.getCurrentSession(currentModel);
@@ -464,10 +502,49 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         const { message: text, files: transformerFiles } = transformResult;
 
         // Combine transformer files with pending file attachments from tool results
-        const fileAttachments = [...transformerFiles, ...pendingFileAttachments];
+        const pendingAttachments = [...transformerFiles, ...pendingFileAttachmentsRef.current];
         // Clear pending attachments after combining (they'll be sent with this request)
-        if (pendingFileAttachments.length > 0) {
-          setPendingFileAttachments([]);
+        if (pendingFileAttachmentsRef.current.length > 0) {
+          pendingFileAttachmentsRef.current = [];
+        }
+
+        // Upload pending files if we have SSO token
+        let uploadedFiles: Array<{ id: string; name: string; url: string }> = [];
+        const pendingUploads = pendingAttachments.filter(f => f._pendingContent);
+
+        if (pendingUploads.length > 0) {
+          // Try to get SSO token for file uploads
+          let uploadToken = ssoToken;
+          if (!uploadToken) {
+            try {
+              uploadToken = await tokenManager.getValidToken();
+              setSsoToken(uploadToken);
+            } catch {
+              // No SSO token available - warn and skip file uploads
+              console.log('⚠️ SSO 토큰 없음 - 파일 첨부 건너뜀');
+              fullDisplayResponse += '[!] 파일 첨부를 위해 SSO 인증이 필요합니다. /sso로 로그인해주세요.\n';
+              setCurrentResponse(fullDisplayResponse);
+            }
+          }
+
+          if (uploadToken) {
+            try {
+              console.log(`📤 파일 업로드 중... (${pendingUploads.length}개)`);
+              for (const attachment of pendingUploads) {
+                const uploaded = await fileUploader.upload(uploadToken, {
+                  filename: attachment.name,
+                  content: attachment._pendingContent!,
+                  mimeType: attachment._pendingMimeType,
+                });
+                uploadedFiles.push({ id: uploaded.id, name: uploaded.name, url: uploaded.url });
+                console.log(`✅ 업로드 완료: ${uploaded.name} (${uploaded.id}) → ${uploaded.url}`);
+              }
+            } catch (uploadError) {
+              console.error('파일 업로드 실패:', uploadError);
+              fullDisplayResponse += `[!] 파일 업로드 실패: ${uploadError instanceof Error ? uploadError.message : String(uploadError)}\n`;
+              setCurrentResponse(fullDisplayResponse);
+            }
+          }
         }
 
         // Stream response - just accumulate, don't parse during streaming
@@ -475,8 +552,11 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         let rawResponse = '';
 
         if (authMode === 'apikey') {
-          // A2 API - simpler payload with file attachments
-          for await (const chunk of client.streamQueryA2(credential, text, a2Model, false, fileAttachments)) {
+          // Log A2 API request
+          logger.logA2Request(iteration, text, a2Model, uploadedFiles);
+
+          // A2 API - simpler payload with uploaded file IDs
+          for await (const chunk of client.streamQueryA2(credential, text, a2Model, false, uploadedFiles)) {
             if (chunk.type === 'text' && chunk.content) {
               rawResponse = chunk.content; // A2 returns full response, not incremental
               const displayText = filterOutput(rawResponse);
@@ -574,9 +654,10 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
         if (toolCalls.length > 0) {
           // Add assistant message with tool calls to conversation history FIRST
+          // Sanitize backticks for API compatibility
           const assistantWithTools: Message = {
             role: 'assistant',
-            content: cleanResponse || `[도구 ${toolCalls.length}개 호출]`,
+            content: sanitizeBackticks(cleanResponse || `[도구 ${toolCalls.length}개 호출]`),
           };
           conversationMessages.push(assistantWithTools);
 
@@ -602,7 +683,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             // Check if confirmation needed
             const needsConfirmation = ['run_terminal_command', 'create_new_file', 'edit_file', 'file.applyTextEdits'].includes(toolCall.toolName);
 
-            if (needsConfirmation && !autoConfirm) {
+            if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName)) {
               // Save loop state for resumption after confirmation
               pendingLoopStateRef.current = {
                 iteration,
@@ -632,7 +713,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
             // Collect file attachment if present (for large file.read results)
             if (result.fileAttachment) {
-              setPendingFileAttachments(prev => [...prev, result.fileAttachment!]);
+              pendingFileAttachmentsRef.current.push(result.fileAttachment);
             }
 
             // Add summarized output to display response
@@ -660,8 +741,8 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
           fullDisplayResponse += filterOutput(cleanResponse);
           setCurrentResponse(fullDisplayResponse);
 
-          // Add final assistant message
-          const assistantMessage: Message = { role: 'assistant', content: fullDisplayResponse };
+          // Add final assistant message (sanitize backticks for API compatibility)
+          const assistantMessage: Message = { role: 'assistant', content: sanitizeBackticks(fullDisplayResponse) };
           setMessages((prev) => [...prev, assistantMessage]);
           sessionService.addMessage(assistantMessage);
           logger.logLoopEnd(loopEndReason, iteration, `response_length=${fullDisplayResponse.length}`);
@@ -673,7 +754,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         loopEndReason = 'max_iterations';
         fullDisplayResponse += '\n\n[!] 최대 반복 횟수에 도달했습니다.';
         setCurrentResponse(fullDisplayResponse);
-        const assistantMessage: Message = { role: 'assistant', content: fullDisplayResponse };
+        const assistantMessage: Message = { role: 'assistant', content: sanitizeBackticks(fullDisplayResponse) };
         setMessages((prev) => [...prev, assistantMessage]);
         sessionService.addMessage(assistantMessage);
         logger.logLoopEnd(loopEndReason, iteration);
@@ -713,7 +794,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       setCurrentResponse('');
       setCurrentTool(null);
     }
-  }, [state, messages, currentModel, initializeChatRoom, autoConfirm]);
+  }, [state, messages, currentModel, initializeChatRoom, shouldAutoConfirm]);
 
   // Handle slash commands
   const handleSlashCommand = useCallback((input: string) => {
@@ -794,12 +875,46 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
       case 'autoconfirm':
       case 'auto': {
-        const newValue = !autoConfirm;
-        setAutoConfirm(newValue);
-        setMessages((prev) => [...prev, {
-          role: 'assistant',
-          content: `[SYSTEM] 자동승인: ${newValue ? 'ON' : 'OFF'}`,
-        }]);
+        // /autoconfirm - show current settings
+        // /autoconfirm <tool> on|off - set per-tool (e.g., /autoconfirm file.applyTextEdits on)
+        // /autoconfirm all on|off - set global default
+        // /autoconfirm reset - clear all settings
+        if (!args[0]) {
+          // Show current settings
+          const settings = Object.entries(autoConfirmSettings);
+          const msg = settings.length === 0
+            ? '자동승인 설정 없음 (모든 도구 수동 확인)\n\n사용법:\n  /autoconfirm <tool> on|off\n  /autoconfirm file.* on\n  /autoconfirm all on\n  /autoconfirm reset'
+            : '자동승인 설정:\n' + settings.map(([k, v]) => `  ${k}: ${v ? 'ON' : 'OFF'}`).join('\n');
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: `[SYSTEM] ${msg}`,
+          }]);
+        } else if (args[0] === 'reset') {
+          setAutoConfirmSettings({});
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: '[SYSTEM] 자동승인 설정 초기화됨',
+          }]);
+        } else {
+          const toolName = args[0];
+          const value = args[1]?.toLowerCase();
+          if (value === 'on' || value === 'off' || value === 'true' || value === 'false') {
+            const enabled = value === 'on' || value === 'true';
+            setAutoConfirmSettings((prev) => ({ ...prev, [toolName]: enabled }));
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] 자동승인: ${toolName} = ${enabled ? 'ON' : 'OFF'}`,
+            }]);
+          } else {
+            // Toggle if no value specified
+            const currentValue = autoConfirmSettings[toolName] ?? false;
+            setAutoConfirmSettings((prev) => ({ ...prev, [toolName]: !currentValue }));
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] 자동승인: ${toolName} = ${!currentValue ? 'ON' : 'OFF'}`,
+            }]);
+          }
+        }
         break;
       }
 
@@ -980,7 +1095,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       default:
 setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 시작합니다.\n2. 주요 명령어 사용법:\n   - /help : 모든 명령어와 사용법 안내를 출력합니다.\n     예시) /help\n   - /exit : 프로그램을 종료합니다.\n     예시) /exit\n   - /clear : 대화 내용을 초기화합니다.\n     예시) /clear\n   - /model <모델명> : 사용할 AI 모델을 변경합니다.\n     예시) /model gpt-4o\n   - /config : 현재 설정을 확인합니다.\n     예시) /config\n\n3. 명령어 입력 방법:\n   - 반드시 슬래시(/)로 시작하세요.\n   - 각 명령어 뒤에 필요한 인자를 입력하세요.\n   - 예시) /model gpt-4o\n\n4. 공식 문서에서 각 명령어의 상세 설명을 확인할 수 있습니다.\n\n더 궁금한 점이 있으면 언제든 /help를 입력하세요. 😊`);
     }
-  }, [exit, messages, autoConfirm, authMode]);
+  }, [exit, messages, autoConfirmSettings, authMode]);
 
   // Handle session subcommands
   const handleSessionCommand = useCallback(async (args: string[]) => {
@@ -1057,7 +1172,7 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
 
       // Collect file attachment if present (for large file.read results)
       if (result.fileAttachment) {
-        setPendingFileAttachments(prev => [...prev, result.fileAttachment!]);
+        pendingFileAttachmentsRef.current.push(result.fileAttachment);
       }
 
       // Add summarized output to display response
@@ -1124,7 +1239,7 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
     }
 
     const loopState = pendingLoopStateRef.current;
-    const { client, sessionService, transformer, toolExecutor, logger } = servicesRef.current;
+    const { client, sessionService, transformer, toolExecutor, logger, fileUploader, tokenManager } = servicesRef.current;
     const modelConfig = AVAILABLE_MODELS[currentModel];
 
     // Filter output helper
@@ -1169,7 +1284,7 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
         // Check if confirmation needed
         const needsConfirmation = ['run_terminal_command', 'create_new_file', 'edit_file', 'file.applyTextEdits'].includes(toolCall.toolName);
 
-        if (needsConfirmation && !autoConfirm) {
+        if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName)) {
           // Save updated loop state and wait for confirmation
           pendingLoopStateRef.current = {
             ...loopState,
@@ -1194,7 +1309,7 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
 
         // Collect file attachment if present (for large file.read results)
         if (result.fileAttachment) {
-          setPendingFileAttachments(prev => [...prev, result.fileAttachment!]);
+          pendingFileAttachmentsRef.current.push(result.fileAttachment);
         }
 
         // Add summarized output to display response
@@ -1224,10 +1339,45 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
         const { message: text, files: transformerFiles } = transformResult;
 
         // Combine transformer files with pending file attachments from tool results
-        const fileAttachments = [...transformerFiles, ...pendingFileAttachments];
+        const pendingAttachments = [...transformerFiles, ...pendingFileAttachmentsRef.current];
         // Clear pending attachments after combining
-        if (pendingFileAttachments.length > 0) {
-          setPendingFileAttachments([]);
+        if (pendingFileAttachmentsRef.current.length > 0) {
+          pendingFileAttachmentsRef.current = [];
+        }
+
+        // Upload pending files if we have SSO token
+        let uploadedFiles: Array<{ id: string; name: string; url: string }> = [];
+        const pendingUploads = pendingAttachments.filter(f => f._pendingContent);
+
+        if (pendingUploads.length > 0) {
+          // Try to get SSO token for file uploads
+          let uploadToken = ssoToken;
+          if (!uploadToken) {
+            try {
+              uploadToken = await tokenManager.getValidToken();
+              setSsoToken(uploadToken);
+            } catch {
+              // No SSO token available - skip file uploads
+              console.log('⚠️ SSO 토큰 없음 - 파일 첨부 건너뜀');
+            }
+          }
+
+          if (uploadToken) {
+            try {
+              console.log(`📤 파일 업로드 중... (${pendingUploads.length}개)`);
+              for (const attachment of pendingUploads) {
+                const uploaded = await fileUploader.upload(uploadToken, {
+                  filename: attachment.name,
+                  content: attachment._pendingContent!,
+                  mimeType: attachment._pendingMimeType,
+                });
+                uploadedFiles.push({ id: uploaded.id, name: uploaded.name, url: uploaded.url });
+                console.log(`✅ 업로드 완료: ${uploaded.name} (${uploaded.id}) → ${uploaded.url}`);
+              }
+            } catch (uploadError) {
+              console.error('파일 업로드 실패:', uploadError);
+            }
+          }
         }
 
         // Stream response
@@ -1235,8 +1385,11 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
         let rawResponse = '';
 
         if (loopAuthMode === 'apikey') {
-          // A2 API with file attachments
-          for await (const chunk of client.streamQueryA2(credential, text, loopA2Model, false, fileAttachments)) {
+          // Log A2 API request
+          logger.logA2Request(iteration, text, loopA2Model, uploadedFiles);
+
+          // A2 API with uploaded file IDs
+          for await (const chunk of client.streamQueryA2(credential, text, loopA2Model, false, uploadedFiles)) {
             if (chunk.type === 'text' && chunk.content) {
               rawResponse = chunk.content;
               const displayText = filterOutput(rawResponse);
@@ -1287,10 +1440,10 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
         logger.logToolCalls(iteration, newToolCalls);
 
         if (newToolCalls.length > 0) {
-          // Add assistant message with tool calls
+          // Add assistant message with tool calls (sanitize backticks for API compatibility)
           const assistantWithTools: Message = {
             role: 'assistant',
-            content: cleanResponse || `[도구 ${newToolCalls.length}개 호출]`,
+            content: sanitizeBackticks(cleanResponse || `[도구 ${newToolCalls.length}개 호출]`),
           };
           conversationMessages.push(assistantWithTools);
 
@@ -1315,7 +1468,7 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
             // Check if confirmation needed
             const needsConfirmation = ['run_terminal_command', 'create_new_file', 'edit_file', 'file.applyTextEdits'].includes(toolCall.toolName);
 
-            if (needsConfirmation && !autoConfirm) {
+            if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName)) {
               // Save loop state and wait for confirmation
               pendingLoopStateRef.current = {
                 iteration,
@@ -1345,7 +1498,7 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
 
             // Collect file attachment if present (for large file.read results)
             if (result.fileAttachment) {
-              setPendingFileAttachments(prev => [...prev, result.fileAttachment!]);
+              pendingFileAttachmentsRef.current.push(result.fileAttachment);
             }
 
             // Add summarized output
@@ -1370,8 +1523,8 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
           fullDisplayResponse += filterOutput(cleanResponse);
           setCurrentResponse(fullDisplayResponse);
 
-          // Add final assistant message
-          const assistantMessage: Message = { role: 'assistant', content: fullDisplayResponse };
+          // Add final assistant message (sanitize backticks for API compatibility)
+          const assistantMessage: Message = { role: 'assistant', content: sanitizeBackticks(fullDisplayResponse) };
           setMessages((prev) => [...prev, assistantMessage]);
           sessionService.addMessage(assistantMessage);
           loopEndReason = 'completed';
@@ -1382,7 +1535,7 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
       if (iteration >= MAX_AGENT_ITERATIONS) {
         fullDisplayResponse += '\n\n[!] 최대 반복 횟수에 도달했습니다.';
         setCurrentResponse(fullDisplayResponse);
-        const assistantMessage: Message = { role: 'assistant', content: fullDisplayResponse };
+        const assistantMessage: Message = { role: 'assistant', content: sanitizeBackticks(fullDisplayResponse) };
         setMessages((prev) => [...prev, assistantMessage]);
         sessionService.addMessage(assistantMessage);
         loopEndReason = 'max_iterations';
@@ -1402,7 +1555,7 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
       setCurrentTool(null);
       pendingLoopStateRef.current = null;
     }
-  }, [currentModel, autoConfirm]);
+  }, [currentModel, shouldAutoConfirm]);
 
   // Handle pending resume - useEffect to resume agentic loop after tool confirmation
   useEffect(() => {
