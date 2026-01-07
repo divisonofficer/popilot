@@ -111,14 +111,36 @@ const MAX_ERROR_RETRIES = 3;
  */
 function summarizeToolOutput(toolName: string, args: Record<string, unknown>, result: string): string {
   const filepath = String(args.filepath || args.dirpath || '');
+  const shortPath = filepath.length > 30 ? '...' + filepath.slice(-27) : filepath;
 
   switch (toolName) {
     case 'read_file':
     case 'file.read': {
       // Extract line count from result
       const linesMatch = result.match(/Lines: (\d+)/);
-      const lines = linesMatch ? linesMatch[1] : '?';
-      return `📄 파일 읽기: ${filepath} (${lines}줄)`;
+      const totalLines = linesMatch ? linesMatch[1] : '?';
+      const startLine = args.startLine as number | undefined;
+      const endLine = args.endLine as number | undefined;
+
+      // 범위 표시
+      let rangeStr = `(${totalLines}줄)`;
+      if (startLine || endLine) {
+        rangeStr = `(${startLine || 1}-${endLine || '끝'}, ${totalLines}줄)`;
+      }
+
+      // 첫 줄 미리보기 (부분 읽기인 경우만)
+      let preview = '';
+      if (startLine || endLine) {
+        const contentLines = result.split('\n');
+        // 번호가 붙은 라인 찾기 (예: "  10\t" 또는 "  10|")
+        const contentStart = contentLines.findIndex(l => l.match(/^\s*\d+[\t|]/));
+        if (contentStart !== -1) {
+          const firstContent = contentLines[contentStart].replace(/^\s*\d+[\t|]\s*/, '');
+          preview = ` "${firstContent.slice(0, 30).trim()}${firstContent.length > 30 ? '...' : ''}"`;
+        }
+      }
+
+      return `📄 파일 읽기: ${shortPath} ${rangeStr}${preview}`;
     }
 
     case 'list_directory': {
@@ -133,15 +155,61 @@ function summarizeToolOutput(toolName: string, args: Record<string, unknown>, re
       return `✏️ 파일 수정: ${filepath}`;
 
     case 'file.applyTextEdits': {
-      const edits = args.edits;
+      const edits = args.edits as Array<{ startLine?: number; endLine?: number; newText?: string }> | undefined;
       const editCount = Array.isArray(edits) ? edits.length : 1;
-      return `✏️ 파일 부분 수정: ${filepath} (${editCount}개 편집)`;
+
+      // diff 미리보기 생성 (최대 2개 편집)
+      let diffPreview = '';
+      if (Array.isArray(edits) && edits.length > 0) {
+        const previewLines: string[] = [];
+
+        for (const edit of edits.slice(0, 2)) {
+          const startLine = edit.startLine ?? 1;
+          const endLineVal = edit.endLine;
+          const newText = edit.newText ?? '';
+
+          // 삭제 라인 (endLine이 startLine보다 크면 삭제됨)
+          if (endLineVal && endLineVal >= startLine && !newText) {
+            previewLines.push(`  - L${startLine}-${endLineVal} 삭제`);
+          } else if (endLineVal && endLineVal >= startLine && newText) {
+            previewLines.push(`  ± L${startLine}-${endLineVal} 교체`);
+          }
+
+          // 추가/교체 라인 미리보기
+          if (newText) {
+            const firstNewLine = newText.split('\n')[0].trim();
+            const truncated = firstNewLine.slice(0, 35);
+            previewLines.push(`  + "${truncated}${firstNewLine.length > 35 ? '...' : ''}"`);
+          }
+        }
+
+        if (edits.length > 2) {
+          previewLines.push(`  ... +${edits.length - 2}개 편집`);
+        }
+
+        if (previewLines.length > 0) {
+          diffPreview = '\n' + previewLines.join('\n');
+        }
+      }
+
+      return `✏️ 파일 부분 수정: ${shortPath} (${editCount}개 편집)${diffPreview}`;
     }
 
     case 'file.search': {
+      const pattern = String(args.pattern || '');
+      const shortPattern = pattern.length > 15 ? pattern.slice(0, 15) + '...' : pattern;
       const matchCount = result.match(/Found (\d+) matches/);
       const matches = matchCount ? matchCount[1] : '0';
-      return `🔍 파일 검색: ${filepath} (${matches}개 일치)`;
+
+      // 첫 매칭 내용 추출 (Line N: content)
+      let firstMatch = '';
+      const lineMatch = result.match(/Line \d+:\s*(.+)/);
+      if (lineMatch) {
+        const matchText = lineMatch[1].trim();
+        firstMatch = ` → "${matchText.slice(0, 30)}${matchText.length > 30 ? '...' : ''}"`;
+      }
+
+      return `🔍 파일 검색: "${shortPattern}" in ${shortPath} (${matches}개)${firstMatch}`;
     }
 
     case 'run_terminal_command': {
@@ -152,10 +220,31 @@ function summarizeToolOutput(toolName: string, args: Record<string, unknown>, re
 
     case 'find_files':
     case 'file.find': {
-      const pattern = String(args.pattern || args.name || '*');
-      const fileCount = result.match(/Found (\d+) file/);
-      const count = fileCount ? fileCount[1] : '?';
-      return `🔍 파일 검색: "${pattern}" (${count}개 파일)`;
+      const pattern = String(args.pattern || args.name || args.query || '*');
+
+      // 파일 리스트 파싱: "Found N file(s)...\n  - path1\n  - path2"
+      const fileLines = result.split('\n').filter(l => l.startsWith('  - '));
+      const files = fileLines.map(l => {
+        const fullPath = l.replace('  - ', '').trim();
+        // 파일명만 추출
+        const parts = fullPath.split('/');
+        return parts[parts.length - 1];
+      });
+
+      // 한 줄에 맞게 truncate (45자 제한)
+      let fileList = files.join(', ');
+      if (fileList.length > 45) {
+        const shown: string[] = [];
+        let len = 0;
+        for (const f of files) {
+          if (len + f.length + 2 > 40) break;
+          shown.push(f);
+          len += f.length + 2;
+        }
+        fileList = shown.join(', ') + ` +${files.length - shown.length}개`;
+      }
+
+      return `🔍 파일 검색: "${pattern}" → ${fileList || '없음'}`;
     }
 
     case 'tree': {
