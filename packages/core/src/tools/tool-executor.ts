@@ -1199,11 +1199,78 @@ ${editsStr.slice(0, 200)}
         return `[Error] SHA256 mismatch! Expected: ${expectedSha.slice(0, 16)}..., Got: ${currentSha.slice(0, 16)}...\nFile was modified. Please re-read and retry.`;
       }
 
-      // 중복 콘텐츠 감지 - 같은 내용 반복 추가 방지
+      const lines = content.split('\n');
+      const totalLines = lines.length;
+
+      // ============================================================
+      // 파괴적 작업 방지 (Destructive Operation Prevention)
+      // ============================================================
       for (const edit of edits) {
+        const startLine = edit.startLine ?? 1;
+        const endLine = edit.endLine ?? startLine;
+        const deletedLineCount = endLine - startLine + 1;
+        const newText = edit.newText ?? '';
+        const newLineCount = newText ? newText.split('\n').length : 0;
+
+        // 1. 빈 newText로 대량 삭제 방지 (10줄 이상 삭제 시)
+        if (deletedLineCount > 10 && (!newText || newText.trim() === '')) {
+          return `[ERROR] 파괴적 작업 거부!
+
+파일: ${filepath}
+시도한 작업: ${deletedLineCount}줄 삭제 (라인 ${startLine}-${endLine})
+newText: ${newText === '' ? '빈 문자열' : newText === null ? 'null' : '공백만'}
+
+[!] ${deletedLineCount}줄을 빈 문자열로 교체하는 것은 파일 삭제와 같습니다.
+[!] 특정 라인만 수정하려면 해당 라인 범위와 새 내용을 정확히 지정하세요.
+
+올바른 사용법:
+- 라인 10-15 수정: startLine=10, endLine=15, newText="수정된 내용"
+- 라인 10 삭제: startLine=10, endLine=10, newText=""
+- 라인 10 후 삽입: startLine=10 (endLine 없이), newText="새 내용"`;
+        }
+
+        // 2. 파일의 50% 이상 삭제 방지
+        const deletionRatio = deletedLineCount / totalLines;
+        if (deletionRatio > 0.5 && newLineCount < deletedLineCount * 0.3) {
+          return `[ERROR] 대량 삭제 작업 거부!
+
+파일: ${filepath} (총 ${totalLines}줄)
+시도한 작업: ${deletedLineCount}줄 삭제 (${Math.round(deletionRatio * 100)}% 삭제)
+교체 내용: ${newLineCount}줄
+
+[!] 파일의 50% 이상을 삭제하는 작업은 허용되지 않습니다.
+[!] 파일 전체를 다시 작성하려면 file.write 도구를 사용하세요.
+[!] 특정 부분만 수정하려면 정확한 라인 범위를 지정하세요.`;
+        }
+
+        // 3. 빈 파일 생성 방지 (결과가 빈 SHA256)
+        // SHA256 of empty string: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        if (totalLines === deletedLineCount && (!newText || newText.trim() === '')) {
+          return `[ERROR] 파일 전체 삭제 거부!
+
+파일: ${filepath}
+시도한 작업: 전체 ${totalLines}줄을 빈 내용으로 교체
+
+[!] 이 작업은 파일을 완전히 비우게 됩니다.
+[!] 파일을 삭제하려면 shell 도구로 rm 명령을 사용하세요.
+[!] 파일을 다시 작성하려면 file.write 도구를 사용하세요.`;
+        }
+      }
+
+      // 중복 콘텐츠 감지 - INSERT 모드에서만 (REPLACE 모드에서는 정상적인 교체)
+      for (const edit of edits) {
+        // REPLACE 모드 (endLine이 있음)는 중복 감지 건너뛰기 - 교체는 정상 동작
+        const isReplaceMode = edit.endLine !== undefined && edit.endLine >= (edit.startLine ?? 1);
+        if (isReplaceMode) {
+          continue;  // REPLACE는 기존 라인을 교체하므로 중복 감지 불필요
+        }
+
+        // INSERT 모드에서만 중복 감지
         if (edit.newText && edit.newText.length > 50) {
-          // 추가하려는 내용의 첫 200자를 정규화하여 비교
-          const newTextSample = edit.newText.trim().slice(0, 200);
+          const newText = edit.newText.trim();
+
+          // 방법 1: 첫 200자 정확 일치
+          const newTextSample = newText.slice(0, 200);
           if (content.includes(newTextSample)) {
             return `[WARNING] 추가하려는 내용이 이미 파일에 존재합니다!
 
@@ -1217,10 +1284,32 @@ ${editsStr.slice(0, 200)}
 
 [!] 중복 추가를 방지하기 위해 편집이 취소되었습니다.`;
           }
+
+          // 방법 2: 핵심 라인 체크 (주석이 아닌 실제 코드/마크업)
+          const newLines = newText.split('\n').filter(line => {
+            const trimmed = line.trim();
+            // 주석, 빈 줄, 짧은 줄 제외
+            if (!trimmed || trimmed.length < 10) return false;
+            if (trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*') || trimmed.startsWith('#')) return false;
+            if (trimmed.startsWith('<!--') && trimmed.endsWith('-->')) return false;
+            return true;
+          });
+
+          // 실제 코드 라인 중 하나라도 파일에 이미 존재하면 경고
+          for (const line of newLines.slice(0, 5)) {  // 처음 5개 핵심 라인만 체크
+            const trimmedLine = line.trim();
+            if (content.includes(trimmedLine)) {
+              return `[WARNING] 추가하려는 코드가 이미 파일에 존재합니다!
+
+파일: ${filepath}
+중복된 라인: "${trimmedLine.slice(0, 80)}${trimmedLine.length > 80 ? '...' : ''}"
+
+파일을 다시 읽어서 현재 상태를 확인하세요.
+[!] 중복 추가를 방지하기 위해 편집이 취소되었습니다.`;
+            }
+          }
         }
       }
-
-      const lines = content.split('\n');
 
       // Sort edits by startLine descending to apply from bottom to top
       const sortedEdits = [...edits].sort((a, b) => (b.startLine ?? 0) - (a.startLine ?? 0));
@@ -1298,11 +1387,17 @@ ${editsStr.slice(0, 200)}
         console.log(`  - After splice: file now has ${lines.length} lines`);
       }
 
-      // Write back
-      const newContent = lines.join('\n');
-      await fs.promises.writeFile(filepath, newContent, 'utf-8');
+      // Check dryRun - handle both boolean and string "true"/"false"
+      const dryRunArg = args.dryRun;
+      const isDryRun = dryRunArg === true || dryRunArg === 'true' || dryRunArg === 'True';
 
+      // Write back (or simulate if dryRun)
+      const newContent = lines.join('\n');
       const newSha = crypto.createHash('sha256').update(newContent).digest('hex');
+
+      if (!isDryRun) {
+        await fs.promises.writeFile(filepath, newContent, 'utf-8');
+      }
 
       // Validate syntax after edit
       const syntaxWarnings = this.validateSyntax(newContent, filepath);
@@ -1325,7 +1420,12 @@ ${editsStr.slice(0, 200)}
       }
 
       // Build result message
-      let result = `${correctionNote}Successfully applied ${edits.length} edit(s) to ${filepath}\nNew SHA256: ${newSha}`;
+      let result: string;
+      if (isDryRun) {
+        result = `[DRY RUN - 파일 미변경]\n${correctionNote}Preview: ${edits.length} edit(s) would be applied to ${filepath}\nPreview SHA256: ${newSha}`;
+      } else {
+        result = `${correctionNote}Successfully applied ${edits.length} edit(s) to ${filepath}\nNew SHA256: ${newSha}`;
+      }
 
       if (syntaxWarnings.length > 0) {
         result += '\n\n[!!! SYNTAX WARNINGS - Please verify and fix if needed !!!]\n';

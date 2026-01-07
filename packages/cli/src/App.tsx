@@ -58,6 +58,7 @@ const VALID_AUTOCONFIRM_PATTERNS = [
   ...CONFIRMATION_REQUIRED_TOOLS,
   'file.*',  // Pattern for all file tools
   'all',     // Global setting
+  'dryRun',  // Auto-approve dryRun operations (no actual file changes)
 ] as const;
 
 /**
@@ -159,6 +160,13 @@ function summarizeToolOutput(toolName: string, args: Record<string, unknown>, re
     case 'file.applyTextEdits': {
       const edits = args.edits as Array<{ startLine?: number; endLine?: number; newText?: string }> | undefined;
       const editCount = Array.isArray(edits) ? edits.length : 1;
+      const isDryRun = args.dryRun === true || args.dryRun === 'true' || args.dryRun === 'True';
+
+      // ERROR/WARNING 메시지는 그대로 표시
+      if (result.startsWith('[ERROR]') || result.startsWith('[WARNING]')) {
+        const firstLine = result.split('\n')[0];
+        return `⚠️ ${firstLine}`;
+      }
 
       // diff 미리보기 생성 (최대 2개 편집)
       let diffPreview = '';
@@ -192,6 +200,13 @@ function summarizeToolOutput(toolName: string, args: Record<string, unknown>, re
         if (previewLines.length > 0) {
           diffPreview = '\n' + previewLines.join('\n');
         }
+      }
+
+      // dryRun이면 Preview SHA256도 표시
+      if (isDryRun) {
+        const shaMatch = result.match(/Preview SHA256: ([a-f0-9]+)/);
+        const previewSha = shaMatch ? ` → ${shaMatch[1].slice(0, 12)}...` : '';
+        return `🔍 [DRY RUN] 미리보기: ${shortPath} (${editCount}개 편집)${previewSha}${diffPreview}`;
       }
 
       return `✏️ 파일 부분 수정: ${shortPath} (${editCount}개 편집)${diffPreview}`;
@@ -360,7 +375,15 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
   const [pendingResume, setPendingResume] = useState(false);
 
   // Check if a tool should be auto-confirmed
-  const shouldAutoConfirm = useCallback((toolName: string): boolean => {
+  const shouldAutoConfirm = useCallback((toolName: string, args?: Record<string, unknown>): boolean => {
+    // Check dryRun - if dryRun setting is on and this is a dryRun call, auto-approve
+    if (args && autoConfirmSettings['dryRun']) {
+      const isDryRun = args.dryRun === true || args.dryRun === 'true' || args.dryRun === 'True';
+      if (isDryRun) {
+        return true;
+      }
+    }
+
     // Exact match first
     if (autoConfirmSettings[toolName] !== undefined) {
       return autoConfirmSettings[toolName];
@@ -980,7 +1003,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             // Check if confirmation needed
             const needsConfirmation = CONFIRMATION_REQUIRED_TOOLS.includes(toolCall.toolName as typeof CONFIRMATION_REQUIRED_TOOLS[number]);
 
-            if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName)) {
+            if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName, toolCall.args)) {
               // Save loop state for resumption after confirmation
               pendingLoopStateRef.current = {
                 iteration,
@@ -1762,7 +1785,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
         // Check if confirmation needed
         const needsConfirmation = CONFIRMATION_REQUIRED_TOOLS.includes(toolCall.toolName as typeof CONFIRMATION_REQUIRED_TOOLS[number]);
 
-        if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName)) {
+        if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName, toolCall.args)) {
           // Save updated loop state and wait for confirmation
           pendingLoopStateRef.current = {
             ...loopState,
@@ -1976,7 +1999,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
             // Check if confirmation needed
             const needsConfirmation = CONFIRMATION_REQUIRED_TOOLS.includes(toolCall.toolName as typeof CONFIRMATION_REQUIRED_TOOLS[number]);
 
-            if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName)) {
+            if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName, toolCall.args)) {
               // Save loop state and wait for confirmation
               pendingLoopStateRef.current = {
                 iteration,
