@@ -1,16 +1,18 @@
 /**
  * SSO Authenticator for POSTECH GenAI
- * Supports both OAuth callback mode and manual token input mode
+ * Uses Puppeteer to monitor browser and automatically capture callback URL
  *
  * TypeScript port of continuedev/src/auth/sso_authenticator.py
  */
 
-import * as http from 'node:http';
 import * as fs from 'node:fs';
-import * as net from 'node:net';
 import * as readline from 'node:readline';
 import { URL, URLSearchParams } from 'node:url';
 import open from 'open';
+
+// Puppeteer is optional - dynamically imported
+type PuppeteerBrowser = import('puppeteer').Browser;
+type PuppeteerPage = import('puppeteer').Page;
 
 export interface AuthTokens {
   accessToken: string;
@@ -65,9 +67,9 @@ export class SSOAuthenticator {
    * Authenticate via SSO.
    */
   async authenticate(): Promise<AuthTokens> {
-    if (this.manualMode || isWSL()) {
-      return this.authenticateManual();
-    }
+    // if (this.manualMode || isWSL()) {
+    //   return this.authenticateManual();
+    // }
     return this.authenticateWithCallback();
   }
 
@@ -169,121 +171,96 @@ export class SSOAuthenticator {
   }
 
   /**
-   * OAuth callback authentication - start local server and wait for redirect.
+   * Puppeteer-based authentication - monitors browser URL for callback.
    */
   private async authenticateWithCallback(): Promise<AuthTokens> {
-    const port = await this.getAvailablePort();
-    const redirectUri = `http://localhost:${port}/callback`;
+    // Dynamically import puppeteer (optional dependency)
+    let launch: typeof import('puppeteer').launch;
+    try {
+      const puppeteerModule = await import('puppeteer');
+      launch = puppeteerModule.default?.launch ?? puppeteerModule.launch;
+    } catch {
+      console.log('Puppeteer not available, falling back to manual mode');
+      return this.authenticateManual();
+    }
 
-    // Build auth URL with redirect
-    const authUrl = new URL(this.ssoUrl);
-    authUrl.searchParams.set('redirect_uri', redirectUri);
+    console.log('\n' + '='.repeat(60));
+    console.log('SSO AUTHENTICATION - BROWSER MODE');
+    console.log('='.repeat(60));
+    console.log('\nOpening browser for authentication...');
+    console.log('Please login with your POSTECH account.');
+    console.log('The browser will close automatically after login.\n');
 
-    return new Promise((resolve, reject) => {
-      const server = http.createServer((req, res) => {
-        try {
-          if (!req.url?.includes('/callback')) {
-            res.writeHead(404);
-            res.end('Not found');
-            return;
-          }
+    let browser: PuppeteerBrowser | null = null;
 
-          // The token is in the URL fragment, which browsers don't send to server
-          // So we need to serve a page that extracts it and sends it back
-          res.writeHead(200, { 'Content-Type': 'text/html' });
-          res.end(`
-            <!DOCTYPE html>
-            <html>
-            <head><title>Authentication</title></head>
-            <body>
-              <h1>Processing authentication...</h1>
-              <script>
-                const hash = window.location.hash.substring(1);
-                if (hash) {
-                  fetch('/token?' + hash)
-                    .then(() => {
-                      document.body.innerHTML = '<h1>Authentication successful! You can close this window.</h1>';
-                    });
-                } else {
-                  document.body.innerHTML = '<h1>Authentication failed: No token received</h1>';
-                }
-              </script>
-            </body>
-            </html>
-          `);
-        } catch (error) {
-          res.writeHead(500);
-          res.end('Error');
-        }
+    try {
+      // Launch browser (visible to user for login)
+      browser = await launch({
+        headless: false,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
       });
 
-      // Handle token callback from the HTML page
-      server.on('request', (req, res) => {
-        if (req.url?.startsWith('/token?')) {
-          const params = new URLSearchParams(req.url.slice(7));
-          const accessToken = params.get('access_token');
+      const page: PuppeteerPage = await browser.newPage();
 
-          if (accessToken) {
-            res.writeHead(200);
-            res.end('OK');
-            server.close();
+      // Navigate to SSO URL
+      await page.goto(this.ssoUrl, { waitUntil: 'networkidle2' });
 
-            resolve({
-              accessToken,
-              refreshToken: params.get('refresh_token') || undefined,
-            });
-          } else {
-            res.writeHead(400);
-            res.end('No token');
-          }
-        }
-      });
+      // Wait for URL to match callback pattern (user completes login)
+      const tokens = await this.waitForCallbackUrl(page);
 
-      // Set timeout
-      const timeout = setTimeout(() => {
-        server.close();
-        reject(new AuthenticationError('Authentication timed out'));
-      }, this.timeoutSeconds * 1000);
+      console.log('\n' + '='.repeat(60));
+      console.log('SSO LOGIN SUCCESSFUL!');
+      console.log(`Token length: ${tokens.accessToken.length} chars`);
+      console.log('='.repeat(60) + '\n');
 
-      server.listen(port, () => {
-        console.log(`\nOpening browser for authentication...`);
-        console.log(`If browser doesn't open, visit: ${authUrl.toString()}\n`);
-
-        open(authUrl.toString()).catch(() => {
-          console.log(`Please open this URL manually: ${authUrl.toString()}`);
-        });
-      });
-
-      server.on('close', () => {
-        clearTimeout(timeout);
-      });
-
-      server.on('error', (error) => {
-        clearTimeout(timeout);
-        reject(new AuthenticationError(`Server error: ${error.message}`));
-      });
-    });
+      return tokens;
+    } catch (error) {
+      if (error instanceof AuthenticationError) {
+        throw error;
+      }
+      throw new AuthenticationError(`Browser authentication failed: ${error}`);
+    } finally {
+      if (browser) {
+        await browser.close();
+      }
+    }
   }
 
   /**
-   * Get an available port.
+   * Wait for the browser URL to match callback pattern and extract tokens.
    */
-  private getAvailablePort(): Promise<number> {
-    return new Promise((resolve, reject) => {
-      const server = net.createServer();
+  private async waitForCallbackUrl(page: PuppeteerPage): Promise<AuthTokens> {
+    const startTime = Date.now();
+    const timeoutMs = this.timeoutSeconds * 1000;
 
-      server.listen(0, () => {
-        const address = server.address();
-        if (address && typeof address === 'object') {
-          const port = address.port;
-          server.close(() => resolve(port));
-        } else {
-          server.close(() => reject(new Error('Could not get port')));
+    while (Date.now() - startTime < timeoutMs) {
+      const currentUrl = page.url();
+
+      // Check if URL matches callback pattern
+      if (currentUrl.includes(this.callbackPattern)) {
+        // Extract tokens from URL fragment
+        const tokens = this.extractTokensFromUrl(currentUrl);
+
+        if (tokens.accessToken) {
+          return tokens;
         }
-      });
 
-      server.on('error', reject);
-    });
+        // If no token in URL, try to get it from the page's hash
+        // eslint-disable-next-line @typescript-eslint/no-implied-eval
+        const hash = await page.evaluate('window.location.hash') as string;
+        if (hash) {
+          const hashTokens = this.extractTokensFromFragment(hash);
+          if (hashTokens.accessToken) {
+            return hashTokens;
+          }
+        }
+      }
+
+      // Small delay before next check
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+
+    throw new AuthenticationError('Authentication timed out waiting for callback');
   }
 
   /**

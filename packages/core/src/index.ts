@@ -13,6 +13,7 @@ export {
   type AIAgent,
   type ChatRoomInfo,
   type AuthMode,
+  type UserApiKey,
 } from './client/postech-client.js';
 export { RequestTransformer, type TransformerConfig, type TransformerResult } from './client/request-transformer.js';
 export {

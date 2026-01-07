@@ -93,6 +93,16 @@ export interface ChatRoomInfo {
 }
 
 /**
+ * User API key from server.
+ */
+export interface UserApiKey {
+  id: number;
+  rawApiKey: string;
+  apiKeyPreview: string;
+  createdAt: string;
+}
+
+/**
  * Async HTTP client for POSTECH GenAI API with SSE streaming support.
  */
 export class PostechClient {
@@ -251,6 +261,47 @@ export class PostechClient {
     }
 
     throw new PostechClientError('Invalid response from getUserProfile');
+  }
+
+  /**
+   * Get user's API keys from server.
+   * Requires SSO token for authentication.
+   */
+  async getUserApiKeys(token: string): Promise<UserApiKey[]> {
+    const url = `${this.baseUrl}/v2/datahub/user-api-keys`;
+
+    console.log(`\n=== GET User API Keys ===`);
+    console.log(`URL: ${url}`);
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/plain, */*',
+        Origin: this.baseUrl,
+        Referer: `${this.baseUrl}/home`,
+        'Cache-Control': 'no-store',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+      },
+    });
+
+    if (!response.ok) {
+      throw new PostechClientError(
+        `Failed to get user API keys: ${response.status} ${response.statusText}`,
+        response.status
+      );
+    }
+
+    interface ApiKeysResponse {
+      message?: string;
+      data?: UserApiKey[];
+    }
+    const data = (await response.json()) as ApiKeysResponse;
+    console.log(`Response: Found ${data.data?.length ?? 0} API keys`);
+
+    return data.data ?? [];
   }
 
   /**

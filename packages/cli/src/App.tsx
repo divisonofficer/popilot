@@ -28,6 +28,7 @@ import {
   type AuthMode,
   type FileAttachment,
   type UploadedFile,
+  type UserApiKey,
 } from '@popilot/core';
 import { Header } from './ui/Header.js';
 import { ChatView } from './ui/ChatView.js';
@@ -381,6 +382,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
   const [authMode, setAuthMode] = useState<AuthMode>('apikey');
   const [ssoToken, setSsoToken] = useState<string | null>(null);  // SSO token for file uploads
   const [ssoStatus, setSsoStatus] = useState<'idle' | 'authenticating' | 'success' | 'failed'>('idle');
+  const [isInitializing, setIsInitializing] = useState(true);  // Auto-auth on startup
   // Use ref for file attachments - useState is async and won't update in same iteration
   const pendingFileAttachmentsRef = useRef<FileAttachment[]>([]);
 
@@ -491,6 +493,90 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       setRawMode(false);
     };
   }, [workingDir, setRawMode]);
+
+  /**
+   * Fetch API key from server using SSO token and save it.
+   */
+  const fetchAndSaveApiKey = useCallback(async (ssoToken: string): Promise<string | null> => {
+    if (!servicesRef.current) return null;
+    const { client, apiKeyStorage } = servicesRef.current;
+
+    try {
+      console.log('Fetching API keys from server...');
+      const apiKeys = await client.getUserApiKeys(ssoToken);
+
+      if (apiKeys.length > 0) {
+        // Use the first (most recent) API key
+        const apiKey = apiKeys[0].rawApiKey;
+        apiKeyStorage.saveApiKey(apiKey);
+        console.log(`API key saved: ${apiKeys[0].apiKeyPreview}`);
+        return apiKey;
+      } else {
+        console.log('No API keys found on server. Please create one at https://genai.postech.ac.kr');
+        return null;
+      }
+    } catch (error) {
+      console.error('Failed to fetch API keys:', error);
+      return null;
+    }
+  }, []);
+
+  /**
+   * Auto-authenticate on startup if no API key is available.
+   */
+  useEffect(() => {
+    if (!servicesRef.current) return;
+
+    const autoAuthenticate = async () => {
+      const { apiKeyAuthenticator, tokenManager } = servicesRef.current!;
+
+      // Check if API key already exists
+      if (apiKeyAuthenticator.hasApiKey()) {
+        console.log('Using stored API key');
+        setIsInitializing(false);
+        return;
+      }
+
+      // No API key - try SSO login and fetch API key
+      console.log('No API key found. Starting SSO authentication...');
+      setMessages((prev) => [...prev, {
+        role: 'assistant',
+        content: '[SYSTEM] API 키가 없습니다. SSO 로그인을 시작합니다...',
+      }]);
+
+      try {
+        const token = await tokenManager.getValidToken();
+        setSsoToken(token);
+        setIsAuthenticated(true);
+
+        // Fetch and save API key from server
+        const apiKey = await fetchAndSaveApiKey(token);
+        if (apiKey) {
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: '[SYSTEM] API 키를 서버에서 가져와 저장했습니다.',
+          }]);
+        } else {
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: '[SYSTEM] 서버에 API 키가 없습니다. https://genai.postech.ac.kr 에서 API 키를 발급받으세요.',
+          }]);
+        }
+      } catch (error) {
+        console.error('Auto-authentication failed:', error);
+        setMessages((prev) => [...prev, {
+          role: 'assistant',
+          content: `[SYSTEM] 자동 인증 실패: ${error instanceof Error ? error.message : String(error)}`,
+        }]);
+      } finally {
+        setIsInitializing(false);
+      }
+    };
+
+    // Delay to ensure services are fully initialized
+    const timer = setTimeout(autoAuthenticate, 100);
+    return () => clearTimeout(timer);
+  }, [fetchAndSaveApiKey]);
 
   /**
    * Initialize chat room - fetches user profile and AI agent info.
@@ -1081,7 +1167,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       case 'help':
         setMessages((prev) => [...prev, {
           role: 'assistant',
-          content: `[SYSTEM] 명령어: /model, /clear, /thread, /retry, /config, /autoconfirm, /session, /api, /sso, /auth, /logout, /quit`,
+          content: `[SYSTEM] 명령어: /model, /clear, /thread, /retry, /config, /autoconfirm, /session, /api, /api-refresh, /sso, /auth, /logout, /quit`,
         }]);
         break;
 
@@ -1271,6 +1357,48 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
           role: 'assistant',
           content: `[SYSTEM] 인증 상태: ${status}`,
         }]);
+        break;
+      }
+
+      case 'api-refresh':
+      case 'refresh-api': {
+        // Refresh API key from server via SSO
+        setMessages((prev) => [...prev, {
+          role: 'assistant',
+          content: '[SYSTEM] SSO 로그인 후 API 키를 서버에서 다시 가져옵니다...',
+        }]);
+
+        (async () => {
+          try {
+            const token = await servicesRef.current?.tokenManager.getValidToken();
+            if (!token) {
+              setMessages((prev) => [...prev, {
+                role: 'assistant',
+                content: '[SYSTEM] SSO 인증 실패',
+              }]);
+              return;
+            }
+
+            setSsoToken(token);
+            const apiKey = await fetchAndSaveApiKey(token);
+            if (apiKey) {
+              setMessages((prev) => [...prev, {
+                role: 'assistant',
+                content: '[SYSTEM] API 키가 새로고침되었습니다.',
+              }]);
+            } else {
+              setMessages((prev) => [...prev, {
+                role: 'assistant',
+                content: '[SYSTEM] 서버에 API 키가 없습니다. https://genai.postech.ac.kr 에서 API 키를 발급받으세요.',
+              }]);
+            }
+          } catch (error) {
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] API 키 새로고침 실패: ${error instanceof Error ? error.message : String(error)}`,
+            }]);
+          }
+        })();
         break;
       }
 
