@@ -344,7 +344,9 @@ export class ToolParser {
       .replace(/CODEBLOCK\s*/g, '')
       .replace(/BEGIN_ARG:\s*\S+\s*/g, '')
       .replace(/END_ARG\s*/g, '')
-      .replace(/TOOL_NAME:\s*\S+\s*/g, '');
+      .replace(/TOOL_NAME:\s*\S+\s*/g, '')
+      // Remove API-appended HTML tool comments (A2 API adds these)
+      .replace(/<!--\s*tools?:\s*\w*\s*-->/gi, '');
 
     // Clean up excessive whitespace
     result = result.replace(/\n{3,}/g, '\n\n').trim();

@@ -8,11 +8,11 @@
 import type { Message, ContentPart } from '../types.js';
 
 // Default configuration constants
-// A2 API has more generous limits, so we can afford larger contexts
-const DEFAULT_HARD_LIMIT = 8000;              // Increased for A2 API (was 4400)
-const DEFAULT_MAX_TEXT_LENGTH = 120000;        // Doubled for A2 API (was 60000)
-const DEFAULT_MAX_TOOL_OUTPUT_LENGTH = 8000;   // Doubled for A2 API (was 4000) - includes validation output
-const DEFAULT_KEEP_RECENT_MESSAGES = 10;       // Keep more context (was 6)
+// A2 API has more generous limits AND no thread/history, so we keep more context
+const DEFAULT_HARD_LIMIT = 12000;              // Increased for A2 API (was 4400)
+const DEFAULT_MAX_TEXT_LENGTH = 200000;        // Increased for A2 API no-thread mode (was 60000)
+const DEFAULT_MAX_TOOL_OUTPUT_LENGTH = 12000;  // Increased for validation output + context (was 4000)
+const DEFAULT_KEEP_RECENT_MESSAGES = 20;       // Keep much more context since A2 has no thread (was 6)
 
 /**
  * Configuration options for RequestTransformer.
@@ -39,7 +39,7 @@ function generateResponseConstraint(hardLimit: number): string {
 
 // GPT-specific tool reminder (GPT tends to ignore tool system)
 const GPT_TOOL_REMINDER = `
-[CRITICAL] You have REAL tools connected to this system. When I ask to modify files, you MUST use the [CODE]tool format below.
+[CRITICAL] You have REAL tools connected to this system. When I ask to modify files, you MUST use the tool format below.
 Do NOT say "I cannot execute tools" - you CAN and MUST use them!
 `;
 
@@ -47,23 +47,36 @@ Do NOT say "I cannot execute tools" - you CAN and MUST use them!
 const MCP_TOOL_PROMPT = `
 === Popilot Tool System ===
 
-[!!!] REQUIRED BEHAVIOR [!!!]
 You are a coding agent that directly modifies code. Do NOT explain - EXECUTE!
 
-1. File modification request -> MUST use tools (NO explanations!)
-2. Markdown code blocks FORBIDDEN! -> Use [CODE]tool format only
-3. Here is how to do it FORBIDDEN! -> Directly call tools to modify
-4. Unknown file location -> Use find_files (e.g., pattern="App.tsx")
+1. File modification request -> MUST use tools
+2. Unknown file location -> Use find_files first
+3. Do NOT ask questions - explore with tools!
 
-[!] Explanation-only responses are considered FAILURE!
+# [!!!] CRITICAL: EXACT Tool Format [!!!]
 
-# Tool call format:
-[CODE]tool
+YOU MUST USE THIS EXACT FORMAT. NO OTHER FORMAT WILL WORK!
+
+\`\`\`tool
 TOOL_NAME: toolname
 BEGIN_ARG: argname
 value
 END_ARG
-[CODE]
+\`\`\`
+
+[X] WRONG FORMATS (WILL NOT WORK):
+- <!-- tools: xxx --> (HTML comments don't work!)
+- <tool>xxx</tool> (XML tags don't work!)
+- {"tool": "xxx"} (JSON format doesn't work!)
+- function_call: xxx (function call syntax doesn't work!)
+
+[O] ONLY THIS FORMAT WORKS:
+\`\`\`tool
+TOOL_NAME: find_files
+BEGIN_ARG: query
+apptsx
+END_ARG
+\`\`\`
 
 # Available tools:
 
@@ -83,50 +96,105 @@ END_ARG
 5. create_new_file - Create new file
    Args: filepath (required), content (required)
 
-6. edit_file - Overwrite entire file
-   Args: filepath (required), content (required)
+6. file.applyTextEdits - ⭐ PRIMARY TOOL for file modification
+   Args: filepath (required), expectedSha256 (required), edits (required), dryRun (optional)
 
-7. file.applyTextEdits - Partial edit (atomic, recommended)
-   Args: filepath (required), expectedSha256 (required), edits (required)
-   Workflow: file.read to get sha256 -> file.applyTextEdits to modify
+   [!] ALWAYS use dryRun=true first to preview changes!
 
-   [!!!] EDITS FORMAT (REQUIRED):
-   edits: [
-     { "startLine": 10, "endLine": 15, "newText": "replacement code here" }
-   ]
-   - startLine: first line to replace (1-indexed)
-   - endLine: last line to replace (1-indexed)
-   - newText: replacement text (can be multi-line string)
+   MODES:
+   - INSERT: omit endLine → inserts BEFORE startLine (no deletion)
+   - REPLACE: include endLine → replaces lines startLine..endLine (single-line: endLine=startLine)
 
-   [X] WRONG FORMAT (DO NOT USE):
-   - edits: [{ "range": {...} }]  <- WRONG!
-   - edits: []  <- WRONG! Must have at least one edit
-   - edits: null/undefined  <- WRONG!
+   EDITS FORMAT:
+   INSERT: [{ "startLine": 10, "newText": "new code" }]
+   REPLACE: [{ "startLine": 15, "endLine": 20, "newText": "replacement", "anchor": { "expectedText": "old code" } }]
 
-8. run_terminal_command - Execute terminal command
+   [!] For REPLACE, always include anchor.expectedText for safety!
+
+7. run_terminal_command - Execute terminal command
    Args: command (required)
 
-9. tree - Show project structure tree (recursive)
+8. tree - Show project structure tree (recursive)
    Args: dirpath (optional), depth (optional, default: 3)
 
-10. find_files - Find files by name pattern (RECOMMENDED for locating files!)
-    Args: pattern (required, e.g., "*.tsx", "App.tsx", "*config*")
-    [!] Use this instead of run_terminal_command with find!
+9. find_files - Fuzzy file search like VS Code Ctrl+P (RECOMMENDED!)
+    Args: query (required) - partial filename or key characters
+    Examples:
+    - "apptsx" → App.tsx, AppTest.tsx
+    - "reqtrans" → request-transformer.ts
+    - "pkgjson" → package.json
+    - "idx" → index.ts, index.tsx
+    [!] No need for exact glob patterns - just type key characters!
 
-# File modification workflow:
-1. find_files to locate target file (e.g., pattern="App.tsx")
-2. file.search to find exact location in file (get line number)
-3. file.read with startLine/endLine to read only needed part
-4. file.applyTextEdits for partial modification
-5. CHECK the [Modified section preview] in result!
-6. If [SYNTAX WARNINGS] appear, FIX immediately with another file.applyTextEdits
+# [!!!] FILE MODIFICATION - USE file.applyTextEdits! [!!!]
+
+## ⭐ RECOMMENDED: Atomic Line Edits (file.applyTextEdits)
+This tool provides precise, line-based editing with SHA256 verification.
+
+### WORKFLOW (MUST FOLLOW):
+1. file.read to get file content + SHA256
+2. Identify exact line numbers from the output
+3. file.applyTextEdits with dryRun=true first (preview changes)
+4. If preview looks good, file.applyTextEdits with dryRun=false
+
+### ⭐ PREFERRED: INSERT MODE (additive editing)
+Insert new code without deleting existing lines - SAFEST approach!
+
+- Omit endLine entirely (do NOT include endLine at all)
+- newText is inserted BEFORE startLine
+- Existing code is preserved
+- [!] If you include endLine, it becomes REPLACE mode!
+
+Example: Add import at line 5
+\`\`\`tool
+TOOL_NAME: file.applyTextEdits
+BEGIN_ARG: filepath
+packages/cli/src/App.tsx
+END_ARG
+BEGIN_ARG: expectedSha256
+(SHA256 from file.read)
+END_ARG
+BEGIN_ARG: edits
+[{ "startLine": 5, "newText": "import { newModule } from './newModule';" }]
+END_ARG
+\`\`\`
+
+### REPLACE MODE (use only when necessary)
+Only use when you MUST delete existing lines:
+- Provide endLine >= startLine
+- MUST include anchor.expectedText for safety!
+- Single line replace: startLine === endLine
+
+Example: Replace lines 15-17
+\`\`\`tool
+TOOL_NAME: file.applyTextEdits
+BEGIN_ARG: filepath
+packages/cli/src/App.tsx
+END_ARG
+BEGIN_ARG: expectedSha256
+(SHA256 from file.read)
+END_ARG
+BEGIN_ARG: edits
+[{ "startLine": 15, "endLine": 17, "newText": "// Fixed code", "anchor": { "expectedText": "buggy code" } }]
+END_ARG
+\`\`\`
+
+### CRITICAL RULES:
+1. PREFER INSERT over REPLACE when possible
+2. ALWAYS use dryRun=true first to preview changes
+3. For REPLACE: MUST include anchor.expectedText
+4. Line numbers are 1-indexed (from file.read output)
+5. NEVER guess line numbers - always read first!
+6. If SHA256 mismatch: re-read file and retry
+
+### [X] FORBIDDEN:
+- Guessing line numbers without file.read
+- REPLACE without anchor.expectedText
+- Using edit_file (causes file corruption!)
 
 # [!!!] POST-EDIT VERIFICATION [!!!]
-- file.applyTextEdits now returns syntax validation warnings
-- If you see [SYNTAX WARNINGS], you MUST fix them immediately!
-- Common issues: unclosed brackets, broken comments, mismatched quotes
-- Use the [Modified section preview] to verify your edit is correct
-- If edit looks wrong, fix it with another file.applyTextEdits call
+- After file.applyTextEdits, check the diff preview in response
+- If something looks wrong, file.read again and fix with another edit
 
 # Rules:
 - MUST call tools for file operations
@@ -158,16 +226,15 @@ END_ARG
 - Complex edits: break into multiple file.applyTextEdits calls
 
 # [!!!] FORBIDDEN behaviors [!!!]
-1. Please provide file path - FORBIDDEN! Use tree/list_directory
-2. Please upload file - FORBIDDEN! Use file.read
-3. Which file? - FORBIDDEN! Explore yourself
-4. Need more info - FORBIDDEN! Gather info with tools
+1. "Please provide file path" - FORBIDDEN! Use tree/find_files
+2. "Please upload file" - FORBIDDEN! Use file.read
+3. "Which file?" - FORBIDDEN! Explore yourself
+4. "Need more info" - FORBIDDEN! Gather info with tools
 
 # [!!!] ABSOLUTE PROHIBITIONS [!!!]
 1. Do NOT write [Tool Result]: yourself - system provides it
-2. Do NOT fake results like Done or Successfully applied
-3. After file.read, MUST call file.applyTextEdits with [CODE]tool format
-4. Markdown code blocks do NOT modify files!
+2. Do NOT fake results like "Done" or "Successfully applied"
+3. After file.read, MUST use file.applyTextEdits
 `;
 
 function generateUserWrapperPrefix(hardLimit: number): string {
@@ -322,121 +389,21 @@ export class RequestTransformer {
   }
 
   /**
-   * Sanitize text to prevent POSTECH API parsing errors.
+   * Sanitize text for API.
+   * A2 API has issues with backticks in JSON payload.
    */
   private sanitizeText(text: string): string {
-    // Step 1: Replace code block markers with safe alternatives
-    let result = text
-      .replace(/```/g, '[CODE]')
-      .replace(/`/g, '')
-      .replace(/'''/g, '[CODE]')
-      .replace(/"""/g, '[CODE]');
+    // Normalize line endings
+    let result = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
 
-    // Step 2: Handle backslashes properly for double-JSON-encoding
-    result = result
-      .replace(/\\n/g, '\n')
-      .replace(/\\t/g, '\t')
-      .replace(/\\r/g, '')
-      .replace(/\\\\/g, '/');
-
-    // Step 3: Remove remaining single backslashes that could cause issues
-    result = result.replace(/\\(?![nrt"\\/])/g, '');
-
-    // Step 4: Normalize line endings
-    result = result.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-
-    // Step 5: Remove control characters except newline and tab
+    // Remove control characters except newline and tab
     result = result.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
 
-    // Step 5.5: Remove Unicode variation selectors and other invisible characters
-    // These cause "failed to parse stringified json" errors on the backend
-    result = result
-      // Variation selectors (U+FE00-U+FE0F) - make emojis colored but invisible
-      .replace(/[\uFE00-\uFE0F]/g, '')
-      // Zero-width characters
-      .replace(/[\u200B-\u200D\uFEFF]/g, '')
-      // Common emojis to text (warning, check, cross, etc.) - using unicode flag for proper handling
-      .replace(/\u26A0/g, '[!]')  // ⚠ Warning sign
-      .replace(/\u2713|\u2714/g, '[v]')  // ✓✔ Check marks
-      .replace(/\u2717|\u2718/g, '[x]')  // ✗✘ X marks
-      .replace(/\u274C/g, '[x]')  // ❌ Cross mark
-      .replace(/\u2705/g, '[v]')  // ✅ Check mark
-      .replace(/\u{1F4C1}|\u{1F4C2}/gu, '[DIR]')  // 📁📂 Folder
-      .replace(/\u{1F4C4}|\u{1F4C3}/gu, '[FILE]')  // 📄📃 File
-      .replace(/\u{1F4DD}/gu, '[EDIT]')  // 📝 Memo
-      .replace(/\u{1F527}|\u{1F528}/gu, '[TOOL]')  // 🔧🔨 Tools
-      .replace(/\u2753|\u2754/g, '?')  // ❓❔ Question marks
-      .replace(/\u2757|\u2755/g, '!')  // ❗❕ Exclamation marks
-      .replace(/\u{1F4A1}/gu, '[IDEA]')  // 💡 Light bulb
-      .replace(/\u{1F680}/gu, '[GO]')  // 🚀 Rocket
-      .replace(/\u231B|\u23F3/g, '[WAIT]')  // ⏳⌛ Hourglass
-      // Remove any remaining emojis (broad pattern for most emoji ranges)
-      .replace(/[\u{1F300}-\u{1F9FF}]/gu, '')
-      .replace(/[\u{2600}-\u{26FF}]/gu, '')
-      .replace(/[\u{2700}-\u{27BF}]/gu, '');
-
-    // Step 6: Replace box drawing and block characters with ASCII equivalents
-    // These Unicode characters cause "failed to parse stringified json" errors on the backend
-    result = result
-      // Horizontal lines
-      .replace(/[─━┄┅┈┉═]/g, '-')
-      // Vertical lines
-      .replace(/[│┃┆┇┊┋║]/g, '|')
-      // Corners (top-left)
-      .replace(/[┌┍┎┏╔╓╒]/g, '+')
-      // Corners (top-right)
-      .replace(/[┐┑┒┓╗╖╕]/g, '+')
-      // Corners (bottom-left)
-      .replace(/[└┕┖┗╚╙╘]/g, '+')
-      // Corners (bottom-right)
-      .replace(/[┘┙┚┛╝╜╛]/g, '+')
-      // T-junctions
-      .replace(/[├┝┞┟┠┡┢┣╠╟╞]/g, '+')
-      .replace(/[┤┥┦┧┨┩┪┫╣╢╡]/g, '+')
-      .replace(/[┬┭┮┯┰┱┲┳╦╥╤]/g, '+')
-      .replace(/[┴┵┶┷┸┹┺┻╩╨╧]/g, '+')
-      // Cross
-      .replace(/[┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋╬╫╪]/g, '+')
-      // Block elements
-      .replace(/[█▓▒░]/g, '#')
-      .replace(/[▀▄▌▐]/g, '#')
-      // Other common box characters
-      .replace(/[■□▪▫]/g, '#')
-      .replace(/[●○◐◑◒◓]/g, 'o')
-      .replace(/[◆◇◈]/g, '*')
-      .replace(/[★☆]/g, '*')
-      .replace(/[▲△▼▽◀◁▶▷]/g, '>');
-
-    // Step 7: Ensure JSON-safe (final validation)
-    result = this.ensureJsonSafe(result);
+    // Escape backticks to avoid JSON parsing errors in A2 API
+    // Using backslash escape: ` -> \`
+    result = result.replace(/`/g, '\\`');
 
     return result;
-  }
-
-  /**
-   * Ensure text can be safely serialized to JSON.
-   * Does a round-trip encode/decode to catch any issues.
-   */
-  private ensureJsonSafe(text: string): string {
-    try {
-      // Test that the text can be JSON encoded
-      const encoded = JSON.stringify({ test: text });
-      // Parse it back to verify
-      JSON.parse(encoded);
-      return text;
-    } catch {
-      // If encoding fails, do more aggressive sanitization
-      // Remove any characters that could cause issues
-      let safeText = '';
-      for (const char of text) {
-        const code = char.charCodeAt(0);
-        // Keep printable ASCII, newlines, tabs, and common Unicode
-        if (char === '\n' || char === '\t' || (code >= 32 && code < 127) || code >= 160) {
-          safeText += char;
-        }
-      }
-      return safeText;
-    }
   }
 
   /**

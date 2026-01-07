@@ -19,6 +19,7 @@ import { promisify } from 'node:util';
 import { fileReadTool, executeFileRead, type FileReadArgs } from './tools/file-read.js';
 import { fileSearchTool, executeFileSearch, type FileSearchArgs } from './tools/file-search.js';
 import { fileApplyEditsTool, executeFileApplyEdits, type FileApplyEditsArgs } from './tools/file-apply-edits.js';
+import { fuzzyFindFiles, formatFuzzyResults } from './core/fuzzy-finder.js';
 
 const execAsync = promisify(exec);
 
@@ -154,6 +155,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
           },
           required: [],
+        },
+      },
+      // Fuzzy file finder (VS Code Ctrl+P style)
+      {
+        name: 'find_files',
+        description: `Find files by name using fuzzy matching (like VS Code Ctrl+P).
+
+Examples:
+- "apptsx" → finds App.tsx, AppTest.tsx
+- "reqtrans" → finds request-transformer.ts
+- "idx" → finds index.ts, index.tsx
+- "pkg" → finds package.json files
+
+Tips: Use key characters from filename, no need for exact glob patterns.`,
+        inputSchema: {
+          type: 'object',
+          properties: {
+            query: {
+              type: 'string',
+              description: 'Search query - can be partial filename, abbreviation, or key characters',
+            },
+            maxResults: {
+              type: 'number',
+              description: 'Maximum results to return (default: 20, max: 50)',
+            },
+          },
+          required: ['query'],
         },
       },
       // Atomic edit tools
@@ -328,6 +356,27 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             {
               type: 'text',
               text: result || '(empty directory)',
+            },
+          ],
+        };
+      }
+
+      // Fuzzy file finder
+      case 'find_files': {
+        const query = String(args?.query ?? '');
+        if (!query) {
+          throw new Error('query is required');
+        }
+        const maxResults = Math.min(Number(args?.maxResults) || 20, 50);
+
+        const matches = await fuzzyFindFiles(query, WORKSPACE_DIR, maxResults);
+        const result = formatFuzzyResults(query, matches);
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: result,
             },
           ],
         };

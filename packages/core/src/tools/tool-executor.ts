@@ -18,8 +18,15 @@ export interface ToolExecutorConfig {
 
 export interface TextEdit {
   startLine: number;
-  endLine: number;
+  endLine?: number;
   newText: string;
+  /**
+   * Operation mode:
+   * - 'insert': Insert newText BEFORE startLine, delete nothing (endLine is ignored)
+   * - 'replace': Replace lines from startLine to endLine (inclusive) with newText
+   * - Default: 'replace' if endLine >= startLine, 'insert' if endLine < startLine or endLine is omitted
+   */
+  mode?: 'insert' | 'replace';
 }
 
 /**
@@ -383,41 +390,139 @@ export class ToolExecutor {
   }
 
   /**
-   * Find files by name pattern.
-   * Safer alternative to run_terminal_command with find.
+   * Fuzzy match score calculator (VS Code Ctrl+P style)
+   */
+  private fuzzyMatch(query: string, target: string): { score: number; indices: number[] } | null {
+    const queryLower = query.toLowerCase();
+    const targetLower = target.toLowerCase();
+
+    // Exact match
+    if (targetLower === queryLower) {
+      return { score: 1000, indices: Array.from({ length: target.length }, (_, i) => i) };
+    }
+
+    // Contains as substring
+    const substringIdx = targetLower.indexOf(queryLower);
+    if (substringIdx !== -1) {
+      const indices = Array.from({ length: query.length }, (_, i) => substringIdx + i);
+      return { score: substringIdx === 0 ? 500 : 200, indices };
+    }
+
+    // Fuzzy match - characters in order
+    const indices: number[] = [];
+    let queryIdx = 0;
+    let lastMatchIdx = -1;
+    let score = 0;
+    let consecutiveBonus = 0;
+
+    for (let i = 0; i < targetLower.length && queryIdx < queryLower.length; i++) {
+      if (targetLower[i] === queryLower[queryIdx]) {
+        indices.push(i);
+        if (lastMatchIdx === i - 1) {
+          consecutiveBonus += 10;
+        } else {
+          consecutiveBonus = 0;
+        }
+        // Word boundary bonus
+        const prevChar = target[i - 1];
+        if (i === 0 || prevChar === '/' || prevChar === '-' || prevChar === '_' || prevChar === '.') {
+          score += 5;
+        }
+        score += 1 + consecutiveBonus;
+        lastMatchIdx = i;
+        queryIdx++;
+      }
+    }
+
+    if (queryIdx !== queryLower.length) return null;
+
+    // Penalty for spread-out matches
+    if (indices.length > 1) {
+      score -= Math.max(0, indices[indices.length - 1] - indices[0] - indices.length);
+    }
+    // Depth penalty
+    score -= (target.match(/\//g) || []).length * 2;
+
+    return { score, indices };
+  }
+
+  /**
+   * Collect all files recursively (sync)
+   */
+  private collectFilesSync(dir: string, baseDir: string, maxDepth: number, depth: number = 0): string[] {
+    const skipDirs = new Set(['node_modules', '.git', '.turbo', 'dist', 'build', '.next', '__pycache__', '.popilot_log', '.cache', 'coverage']);
+    const files: string[] = [];
+
+    if (depth > maxDepth) return files;
+
+    try {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          if (!skipDirs.has(entry.name)) {
+            files.push(...this.collectFilesSync(path.join(dir, entry.name), baseDir, maxDepth, depth + 1));
+          }
+        } else {
+          files.push(path.relative(baseDir, path.join(dir, entry.name)));
+        }
+      }
+    } catch {
+      // Ignore permission errors
+    }
+
+    return files;
+  }
+
+  /**
+   * Find files using fuzzy matching (VS Code Ctrl+P style)
    */
   private execFindFiles(args: Record<string, unknown>): string {
-    const pattern = String(args.pattern ?? args.name ?? '');
+    const query = String(args.query ?? args.pattern ?? args.name ?? '');
     const dirpath = args.dirpath ? this.resolvePath(String(args.dirpath)) : this.workspaceDir;
     const maxResults = Math.min(Number(args.maxResults) || 20, 50);
 
-    if (!pattern) {
-      return '[Error] pattern is required (e.g., "*.tsx", "App.tsx", "*test*")';
+    if (!query) {
+      return `[Error] query is required. Examples:
+- "apptsx" → finds App.tsx
+- "reqtrans" → finds request-transformer.ts
+- "pkgjson" → finds package.json`;
     }
 
     try {
-      // Build find command with pattern
-      const findCmd = `find . -type f -name "${pattern}" \\
-        -not -path "*/node_modules/*" \\
-        -not -path "*/.git/*" \\
-        -not -path "*/dist/*" \\
-        -not -path "*/.turbo/*" \\
-        -not -path "*/.popilot_log/*" \\
-        2>/dev/null | head -${maxResults}`;
+      // Collect all files
+      const allFiles = this.collectFilesSync(dirpath, dirpath, 10);
 
-      const result = execSync(findCmd, {
-        cwd: dirpath,
-        encoding: 'utf-8',
-        timeout: 10000,
-      });
+      // Match and score
+      const matches: { path: string; score: number }[] = [];
+      for (const filePath of allFiles) {
+        const filename = path.basename(filePath);
+        const filenameMatch = this.fuzzyMatch(query, filename);
+        const pathMatch = this.fuzzyMatch(query, filePath);
 
-      const files = result.trim().split('\n').filter(Boolean).map(f => f.replace(/^\.\//, ''));
+        const match = filenameMatch && pathMatch
+          ? (filenameMatch.score >= pathMatch.score ? filenameMatch : pathMatch)
+          : (filenameMatch || pathMatch);
 
-      if (files.length === 0) {
-        return `No files found matching: ${pattern}`;
+        if (match) {
+          const finalScore = filenameMatch ? match.score + 100 : match.score;
+          matches.push({ path: filePath, score: finalScore });
+        }
       }
 
-      return `Found ${files.length} file(s) matching "${pattern}":\n${files.map(f => `  - ${f}`).join('\n')}`;
+      // Sort by score and limit
+      matches.sort((a, b) => b.score - a.score);
+      const topMatches = matches.slice(0, maxResults);
+
+      if (topMatches.length === 0) {
+        return `No files found matching: "${query}"
+
+Tips:
+- Try shorter query (e.g., "app" instead of "application")
+- Use key characters (e.g., "rt" for "request-transformer")
+- Include extension (e.g., "apptsx" for App.tsx)`;
+      }
+
+      return `Found ${topMatches.length} file(s) matching "${query}":\n${topMatches.map(m => `  - ${m.path}`).join('\n')}`;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
         return `[Error] Directory not found: ${dirpath}`;
@@ -443,6 +548,73 @@ export class ToolExecutor {
   }
 
   /**
+   * Detect abbreviated/placeholder content that would corrupt files.
+   * Returns error message if abbreviated content detected, null otherwise.
+   */
+  private detectAbbreviatedContent(content: string): string | null {
+    // Patterns that indicate abbreviated/summarized content
+    const abbreviationPatterns = [
+      // Korean abbreviations
+      { pattern: /\(생략\)/g, desc: '(생략)' },
+      { pattern: /기존\s*(코드|내용|부분)\s*(유지|그대로)/g, desc: '기존 코드 유지' },
+      { pattern: /아래로\s*교체/g, desc: '아래로 교체' },
+      { pattern: /위와\s*동일/g, desc: '위와 동일' },
+      { pattern: /나머지\s*(동일|유지)/g, desc: '나머지 동일' },
+
+      // English abbreviations
+      { pattern: /\.\.\.\s*(existing|rest|omitted|unchanged)/gi, desc: '... existing/omitted' },
+      { pattern: /\/\*\s*\.\.\.\s*\*\//g, desc: '/* ... */' },
+      { pattern: /\/\/\s*\.\.\./g, desc: '// ...' },
+      { pattern: /\(omitted\)/gi, desc: '(omitted)' },
+      { pattern: /\(rest of file\)/gi, desc: '(rest of file)' },
+      { pattern: /\(unchanged\)/gi, desc: '(unchanged)' },
+      { pattern: /\/\*\s*(rest|remaining)\s*(of\s*)?(file|code)\s*(unchanged|same|here)?\s*\*\//gi, desc: '/* rest of file */' },
+      { pattern: /\/\/\s*(rest|remaining)\s*(of\s*)?(file|code)\s*(unchanged|same|here)?/gi, desc: '// rest of file' },
+
+      // Placeholder patterns in comments
+      { pattern: /\/\*[\s\S]{0,20}\.{3}[\s\S]{0,50}\*\//g, desc: '/* ... */' },
+    ];
+
+    for (const { pattern, desc } of abbreviationPatterns) {
+      if (pattern.test(content)) {
+        return `[Error] Detected abbreviated content pattern: "${desc}"
+
+edit_file requires the COMPLETE file content, not abbreviated or summarized content.
+This would corrupt the file by replacing real code with placeholder text.
+
+To fix:
+1. Use file.read to get the FULL current file content
+2. Modify the content (add/remove/change lines as needed)
+3. Call edit_file with the COMPLETE modified content (every line!)
+
+NEVER use placeholders like "// ... existing code ..." or "(생략)" - include ALL code!`;
+      }
+    }
+
+    // Additional check: if content is suspiciously short for a code file
+    // (less than 10 lines and contains comment-like placeholder)
+    const lines = content.split('\n');
+    if (lines.length < 10) {
+      const hasOnlyComments = lines.every(line =>
+        line.trim() === '' ||
+        line.trim().startsWith('//') ||
+        line.trim().startsWith('/*') ||
+        line.trim().startsWith('*')
+      );
+      if (hasOnlyComments && content.includes('...')) {
+        return `[Error] Content appears to be abbreviated (only ${lines.length} lines, mostly comments with "...")
+
+edit_file requires the COMPLETE file content. Please:
+1. Use file.read to get the full file
+2. Include ALL existing code
+3. Only modify the specific parts you need to change`;
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Edit an existing file.
    */
   private async execEditFile(args: Record<string, unknown>): Promise<string> {
@@ -453,6 +625,12 @@ export class ToolExecutor {
       await fs.promises.access(filepath);
     } catch {
       return this.buildFileNotFoundError(filepath);
+    }
+
+    // Check for abbreviated content before writing
+    const abbreviationError = this.detectAbbreviatedContent(content);
+    if (abbreviationError) {
+      return abbreviationError;
     }
 
     try {
@@ -699,9 +877,17 @@ export class ToolExecutor {
 
   /**
    * Apply text edits to file (atomic operation).
+   *
+   * Edit semantics:
+   * - startLine: First line to be affected (1-indexed, inclusive)
+   * - endLine: Last line to be replaced (1-indexed, inclusive)
+   * - For REPLACE: startLine <= endLine (replaces lines startLine through endLine)
+   * - For INSERT: endLine < startLine OR endLine = startLine - 1 (inserts before startLine, deletes nothing)
+   * - If endLine is omitted: defaults to startLine (replaces single line)
    */
   private async execApplyEdits(args: Record<string, unknown>): Promise<string> {
     // Debug logging
+    console.log('[applyTextEdits] ========== START ==========');
     console.log('[applyTextEdits] Raw args:', JSON.stringify(args, null, 2));
 
     const inputPath = String(args.filepath ?? '');
@@ -780,19 +966,73 @@ export class ToolExecutor {
       const editRanges: Array<{ start: number; end: number; newLineCount: number }> = [];
 
       for (const edit of sortedEdits) {
-        const start = (edit.startLine ?? 1) - 1; // Convert to 0-indexed
-        const end = edit.endLine ?? start + 1;
+        const startLine1 = edit.startLine ?? 1;  // 1-indexed
+        const endLine1 = edit.endLine;  // 1-indexed, may be undefined
+        const start = startLine1 - 1; // Convert to 0-indexed
         const newText = edit.newText ?? '';
+        const explicitMode = (edit as TextEdit).mode;
 
-        // Validate range
-        if (start < 0 || end > lines.length) {
-          return `[Error] Invalid range: ${start + 1}-${end}, file has ${lines.length} lines`;
+        // Determine operation mode
+        // - Explicit 'insert': always insert, delete nothing
+        // - Explicit 'replace': always replace
+        // - No mode + endLine exists: REPLACE (including single-line: startLine === endLine)
+        // - No mode + no endLine: INSERT
+        let isInsertMode: boolean;
+        if (explicitMode === 'insert') {
+          isInsertMode = true;
+        } else if (explicitMode === 'replace') {
+          isInsertMode = false;
+        } else if (endLine1 !== undefined) {
+          // endLine exists → REPLACE mode (single-line replace allowed: startLine === endLine)
+          isInsertMode = false;
+        } else {
+          // No endLine → INSERT mode
+          isInsertMode = true;
         }
 
-        // Replace lines
+        // Calculate delete count
+        let deleteCount: number;
+        if (isInsertMode) {
+          deleteCount = 0;
+        } else {
+          // REPLACE: delete from startLine to endLine inclusive
+          deleteCount = (endLine1 ?? startLine1) - startLine1 + 1;
+        }
+
+        console.log(`[applyTextEdits] Processing edit:`);
+        console.log(`  - startLine (1-indexed): ${startLine1}`);
+        console.log(`  - endLine (1-indexed): ${endLine1 ?? '(not provided)'}`);
+        console.log(`  - mode: ${explicitMode ?? '(auto)'} -> ${isInsertMode ? 'INSERT' : 'REPLACE'}`);
+        console.log(`  - start (0-indexed): ${start}`);
+        console.log(`  - deleteCount: ${deleteCount}`);
+        console.log(`  - newText lines: ${newText ? newText.split('\n').length : 0}`);
+        console.log(`  - file total lines: ${lines.length}`);
+
+        // Validate range
+        if (start < 0 || start > lines.length) {
+          return `[Error] Invalid startLine: ${startLine1}, file has ${lines.length} lines`;
+        }
+        if (deleteCount > 0 && start + deleteCount > lines.length) {
+          return `[Error] Invalid range: lines ${startLine1}-${endLine1}, file only has ${lines.length} lines`;
+        }
+
+        // Show what will be deleted (for debugging)
+        if (deleteCount > 0) {
+          console.log(`  - Lines to delete (${startLine1}-${endLine1}):`);
+          for (let i = 0; i < deleteCount && start + i < lines.length; i++) {
+            const lineContent = lines[start + i];
+            console.log(`    ${startLine1 + i}: ${lineContent.slice(0, 80)}${lineContent.length > 80 ? '...' : ''}`);
+          }
+        } else {
+          console.log(`  - INSERT mode: no lines will be deleted`);
+        }
+
+        // Replace/Insert lines
         const newLines = newText ? newText.trimEnd().split('\n') : [];
-        editRanges.push({ start, end, newLineCount: newLines.length });
-        lines.splice(start, end - start, ...newLines);
+        editRanges.push({ start, end: start + deleteCount, newLineCount: newLines.length });
+        lines.splice(start, deleteCount, ...newLines);
+
+        console.log(`  - After splice: file now has ${lines.length} lines`);
       }
 
       // Write back
@@ -946,7 +1186,7 @@ export class ToolExecutor {
       },
       {
         name: 'file.applyTextEdits',
-        description: 'Apply specific text edits to a file (atomic operation)',
+        description: 'Apply specific text edits to a file (atomic operation). For INSERT: set startLine only or endLine <= startLine. For REPLACE: set endLine > startLine.',
         parameters: {
           filepath: {
             type: 'string',
@@ -960,7 +1200,7 @@ export class ToolExecutor {
           },
           edits: {
             type: 'array',
-            description: 'Array of edits with startLine, endLine, and newText',
+            description: 'Array of edits: { startLine (1-indexed), endLine? (1-indexed), newText, mode? ("insert"|"replace") }. INSERT (no deletion): omit endLine or set endLine <= startLine. REPLACE (delete then insert): set endLine > startLine.',
             required: true,
           },
         },

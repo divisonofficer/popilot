@@ -23,20 +23,57 @@ export interface FileApplyEditsArgs {
   createBackup?: boolean;
 }
 
+/** ---------- NEW: EOL + final newline preservation ---------- */
+function detectEol(text: string): '\r\n' | '\n' {
+  // If any CRLF exists, prefer CRLF
+  return text.includes('\r\n') ? '\r\n' : '\n';
+}
+
+function splitPreserve(text: string) {
+  const eol = detectEol(text);
+  const hasFinalNewline = text.endsWith(eol);
+  const body = hasFinalNewline ? text.slice(0, -eol.length) : text;
+
+  // Keep empty file stable
+  const lines = body.length === 0 ? [] : body.split(eol);
+  return { lines, eol, hasFinalNewline };
+}
+
+function joinPreserve(lines: string[], eol: string, hasFinalNewline: boolean) {
+  const body = lines.join(eol);
+  return hasFinalNewline ? body + eol : body;
+}
+
+/** ---------- NEW: normalize edits so tool semantics are unambiguous ---------- */
+function normalizeEdits(edits: TextEdit[]): TextEdit[] {
+  return edits.map((e) => {
+    const mode =
+      e.mode ?? (e.endLine !== undefined ? 'replace' : 'insert');
+
+    // IMPORTANT: allow single-line replace: endLine === startLine
+    // and define replace by presence of endLine, not endLine > startLine
+    if (mode === 'replace' && e.endLine === undefined) {
+      // Let validator throw a clean error; keep it explicit here for safety
+      return { ...e, mode };
+    }
+
+    return { ...e, mode };
+  });
+}
+
 /**
  * Tool definition for MCP registration
  */
 export const fileApplyEditsTool = {
   name: 'file.applyTextEdits',
-  description: `Apply multiple targeted text edits to a file atomically. All edits must be non-overlapping and valid.
+  description: `Insert or replace lines in a file. For LARGE changes, use edit_file instead!
 
-IMPORTANT WORKFLOW:
-1. First use file.read or file.search to get the current sha256
-2. Include expectedSha256 to prevent race conditions
-3. Keep edits small and targeted (max 80 lines per edit)
-4. Do NOT attempt to replace the entire file with a single edit
+MODES:
+- INSERT: omit endLine → inserts newText BEFORE startLine (no deletion)
+- REPLACE: provide endLine (inclusive) → replaces lines startLine..endLine with newText
+  - single-line replace is allowed: startLine === endLine
 
-If any validation fails, the entire operation is rolled back with no changes.`,
+WORKFLOW: file.read (get sha256) → file.applyTextEdits (dryRun recommended first)`,
   inputSchema: {
     type: 'object',
     properties: {
@@ -46,49 +83,49 @@ If any validation fails, the entire operation is rolled back with no changes.`,
       },
       expectedSha256: {
         type: 'string',
-        description:
-          'Expected SHA256 of the file before editing. Get this from file.read or file.search. Operation fails if mismatch (prevents race conditions).',
+        description: 'Expected SHA256 from file.read. Fails if mismatch.',
       },
       edits: {
         type: 'array',
         minItems: 1,
         maxItems: 50,
-        description: 'List of edits to apply. Applied after sorting by startLine.',
+        description:
+          'Edits to apply. INSERT: omit endLine. REPLACE: include endLine (inclusive).',
         items: {
           type: 'object',
           properties: {
             startLine: {
               type: 'integer',
               minimum: 1,
-              description: '1-indexed start line (inclusive)',
+              description: 'INSERT: line to insert BEFORE. REPLACE: first line to replace.',
             },
             endLine: {
               type: 'integer',
               minimum: 1,
-              description: '1-indexed end line (inclusive). Same as startLine for single-line edit.',
+              description:
+                'OPTIONAL. Omit for INSERT. For REPLACE: last line (inclusive), must be >= startLine.',
             },
             newText: {
               type: 'string',
+              description: 'Text to insert or replace with.',
+            },
+            mode: {
+              type: 'string',
+              enum: ['insert', 'replace'],
               description:
-                'Replacement text. Can be empty for deletion. Include trailing newline if replacing whole lines.',
+                'Optional explicit mode. Default: replace if endLine exists, otherwise insert.',
             },
             anchor: {
               type: 'object',
-              description: 'Optional: expected text at edit location for extra validation',
+              description:
+                'Optional validation. REPLACE strongly recommended to include expectedText.',
               properties: {
-                expectedText: {
-                  type: 'string',
-                  description: 'Expected text (substring match by default)',
-                },
-                strict: {
-                  type: 'boolean',
-                  default: false,
-                  description: 'If true, requires exact match instead of substring',
-                },
+                expectedText: { type: 'string' },
+                strict: { type: 'boolean', default: false },
               },
             },
           },
-          required: ['startLine', 'endLine', 'newText'],
+          required: ['startLine', 'newText'],
         },
       },
       dryRun: {
@@ -114,15 +151,7 @@ function createErrorResponse(code: string, message: string, recovery: string): M
     content: [
       {
         type: 'text',
-        text: JSON.stringify(
-          {
-            error: code,
-            message,
-            recovery,
-          },
-          null,
-          2
-        ),
+        text: JSON.stringify({ error: code, message, recovery }, null, 2),
       },
     ],
     isError: true,
@@ -138,7 +167,8 @@ export async function executeFileApplyEdits(
 ): Promise<MCPToolResult> {
   try {
     const filepath = resolvePath(args.filepath);
-    const { expectedSha256, edits, dryRun = false, createBackup = false } = args;
+    const { expectedSha256, dryRun = false, createBackup = false } = args;
+    const edits = normalizeEdits(args.edits);
 
     // Step 1: Read current file
     let originalContent: string;
@@ -155,7 +185,7 @@ export async function executeFileApplyEdits(
       throw error;
     }
 
-    // Step 2: Verify SHA256 precondition
+    // Step 2: Verify SHA256 precondition (over raw content, before normalization)
     const sha256Check = verifySha256(originalContent, expectedSha256);
     if (!sha256Check.valid) {
       return createErrorResponse(
@@ -165,8 +195,8 @@ export async function executeFileApplyEdits(
       );
     }
 
-    // Step 3: Parse lines
-    const originalLines = originalContent.split('\n');
+    // Step 3: Parse lines with EOL preservation
+    const { lines: originalLines, eol, hasFinalNewline } = splitPreserve(originalContent);
 
     // Step 4: Validate edits
     const validation = validateEdits(originalLines, edits);
@@ -176,11 +206,7 @@ export async function executeFileApplyEdits(
           {
             type: 'text',
             text: JSON.stringify(
-              {
-                success: false,
-                errors: validation.errors,
-                warnings: validation.warnings,
-              },
+              { success: false, errors: validation.errors, warnings: validation.warnings },
               null,
               2
             ),
@@ -192,7 +218,7 @@ export async function executeFileApplyEdits(
 
     // Step 5: Apply edits (in memory)
     const newLines = applyEdits(originalLines, validation.sortedEdits);
-    const newContent = newLines.join('\n');
+    const newContent = joinPreserve(newLines, eol, hasFinalNewline);
 
     // Step 6: Check result guards
     const resultGuards = checkResultGuards(newContent, originalContent);
@@ -202,11 +228,7 @@ export async function executeFileApplyEdits(
           {
             type: 'text',
             text: JSON.stringify(
-              {
-                success: false,
-                errors: resultGuards.errors,
-                stats: resultGuards.stats,
-              },
+              { success: false, errors: resultGuards.errors, stats: resultGuards.stats },
               null,
               2
             ),
@@ -216,7 +238,7 @@ export async function executeFileApplyEdits(
       };
     }
 
-    // Step 7: Generate preview
+    // Step 7: Generate preview (diff는 LF 기준이어도 대개 OK)
     const preview = generateDiffPreview(args.filepath, originalLines, newLines);
     const newSha256 = computeSha256(newContent);
 
@@ -238,10 +260,7 @@ export async function executeFileApplyEdits(
                   linesRemoved: preview.linesRemoved,
                 },
                 warnings: validation.warnings,
-                stats: {
-                  ...validation.stats,
-                  ...resultGuards.stats,
-                },
+                stats: { ...validation.stats, ...resultGuards.stats },
               },
               null,
               2

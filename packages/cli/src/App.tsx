@@ -85,7 +85,7 @@ interface PendingLoopState {
  */
 const DEFAULT_AI_AGENT_ID = 9;
 const DEFAULT_SCENARIO_ID = 'robi-gpt-dev:workflow_wKstTOFnV25Ictc';
-const MAX_AGENT_ITERATIONS = 30;
+const MAX_AGENT_ITERATIONS = 50;  // Increased for complex tasks (A2 API has generous limits)
 const MAX_ERROR_RETRIES = 3;
 
 /**
@@ -130,6 +130,19 @@ function summarizeToolOutput(toolName: string, args: Record<string, unknown>, re
       const command = String(args.command || '');
       const shortCmd = command.length > 50 ? command.slice(0, 50) + '...' : command;
       return `💻 명령 실행: ${shortCmd}`;
+    }
+
+    case 'find_files':
+    case 'file.find': {
+      const pattern = String(args.pattern || args.name || '*');
+      const fileCount = result.match(/Found (\d+) file/);
+      const count = fileCount ? fileCount[1] : '?';
+      return `🔍 파일 검색: "${pattern}" (${count}개 파일)`;
+    }
+
+    case 'tree': {
+      const dirpath = String(args.dirpath || '.');
+      return `🌲 트리 조회: ${dirpath}`;
     }
 
     default:
@@ -398,20 +411,17 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     let iteration = 0;
     let loopEndReason: 'completed' | 'max_iterations' | 'error' | 'unexpected' | 'confirming' = 'unexpected';
 
-    // Filter out debugging output and tool block markers from display
+    // Filter out tool block markers from display (tool syntax not for users)
     const filterOutput = (text: string): string => {
       return text
-        // Remove CHAR_COUNT
-        .replace(/^CHAR_COUNT=\d+\s*\n?/gm, '')
-        .replace(/CHAR_COUNT=\d+\s*/g, '')
-        // Remove tool block markers that weren't parsed (fallback)
-        .replace(/\[CODE\]tool\s*/g, '')
+        // Remove tool block markers
         .replace(/```tool\s*/g, '')
+        .replace(/```\s*$/g, '')
         .replace(/TOOL_NAME:\s*\S+\s*\n?/g, '')
         .replace(/BEGIN_ARG:\s*\S+\s*\n?/g, '')
         .replace(/END_ARG\s*/g, '')
-        .replace(/\[CODE\]\s*/g, '')
-        .replace(/```\s*$/g, '')
+        // Remove API-appended HTML tool comments (A2 API adds these)
+        .replace(/<!--\s*tools?:\s*\w*\s*-->/gi, '')
         // Clean up multiple newlines
         .replace(/\n{3,}/g, '\n\n')
         .trim();
@@ -535,10 +545,11 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         const toolCalls = ToolParser.extractAllToolCalls(rawResponse);
         const cleanResponse = ToolParser.removeToolBlocks(rawResponse);
 
-        // Check for incomplete/malformed tool call attempts (e.g., "<!-- tools: file.read -->")
-        const looksLikeToolAttempt = /<!--\s*tools?:|tool-\w+|TOOL_NAME:|```tool/i.test(rawResponse);
-        const hasValidContent = cleanResponse.trim().length > 20;
+        // Check for incomplete/malformed tool call attempts
+        const looksLikeToolAttempt = /tool-\w+|TOOL_NAME:|```tool/i.test(rawResponse);
 
+        // Check for other malformed attempts
+        const hasValidContent = cleanResponse.trim().length > 20;
         if (toolCalls.length === 0 && looksLikeToolAttempt && !hasValidContent) {
           logger.logIteration(iteration, 'aborted', 'malformed_tool_response');
           logger.logError(iteration, `Malformed tool response: ${rawResponse.slice(0, 200)}`);
@@ -691,9 +702,16 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
   // Handle slash commands
   const handleSlashCommand = useCallback((input: string) => {
-    const [cmd, ...args] = input.slice(1).split(' ');
+    const parts = input.slice(1).split(/\s+/);
+    const cmd = parts[0] || '';
+    const args = parts.slice(1);
 
     switch (cmd.toLowerCase()) {
+      case 'gpt': {
+        // /gpt 명령어는 /model gpt로 동작
+        handleSlashCommand('/model gpt');
+        break;
+      }
       case 'quit':
       case 'exit':
       case 'q':
@@ -739,7 +757,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             });
             setMessages((prev) => [...prev, {
               role: 'assistant',
-              content: `[SYSTEM] 모델 변경: ${modelConfig.modelName}${modelConfig.provider === 'anthropic' ? ' [5KB 제한]' : ''}`,
+              content: `[SYSTEM] 모델 변경: ${modelConfig.modelName}`,
             }]);
           } else {
             const aliases = Object.keys(MODEL_ALIASES).join(', ');
@@ -945,7 +963,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       }
 
       default:
-        setError(`알 수 없는 명령어: /${cmd}. /help로 도움말을 확인하세요.`);
+        setError(`알 수 없는 명령어: /${cmd}.\n\n[Popilot CLI 도움말]\n\n- /help : 모든 명령어와 사용법 안내를 출력합니다.\n- /exit : 프로그램을 종료합니다.\n- /clear : 대화 내용을 초기화합니다.\n- /model <모델명> : 사용할 AI 모델을 변경합니다.\n- /config : 현재 설정을 확인합니다.\n\n명령어는 슬래시(/)로 시작하며, 자세한 사용법은 공식 문서를 참고하세요!\n\n예시) /model gpt-4o\n\n더 궁금한 점이 있으면 언제든 /help를 입력하세요. 😊`);
     }
   }, [exit, messages, autoConfirm, authMode]);
 
@@ -1090,17 +1108,16 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     const modelConfig = AVAILABLE_MODELS[currentModel];
 
     // Filter output helper
+    // Filter out tool block markers from display
     const filterOutput = (text: string): string => {
       return text
-        .replace(/^CHAR_COUNT=\d+\s*\n?/gm, '')
-        .replace(/CHAR_COUNT=\d+\s*/g, '')
-        .replace(/\[CODE\]tool\s*/g, '')
         .replace(/```tool\s*/g, '')
+        .replace(/```\s*$/g, '')
         .replace(/TOOL_NAME:\s*\S+\s*\n?/g, '')
         .replace(/BEGIN_ARG:\s*\S+\s*\n?/g, '')
         .replace(/END_ARG\s*/g, '')
-        .replace(/\[CODE\]\s*/g, '')
-        .replace(/```\s*$/g, '')
+        // Remove API-appended HTML tool comments (A2 API adds these)
+        .replace(/<!--\s*tools?:\s*\w*\s*-->/gi, '')
         .replace(/\n{3,}/g, '\n\n')
         .trim();
     };

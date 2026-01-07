@@ -604,6 +604,60 @@ export class PostechClient {
   }
 
   /**
+   * Create a file object for A2 API from text content.
+   * Uses data URI format to embed content directly.
+   *
+   * @param name - File name (e.g., "App.tsx")
+   * @param content - File content as string
+   * @param id - Optional unique ID (defaults to name)
+   */
+  static createFileFromContent(
+    name: string,
+    content: string,
+    id?: string
+  ): { id: string; name: string; url: string } {
+    // Encode content as base64 data URI
+    const base64Content = Buffer.from(content, 'utf-8').toString('base64');
+    const mimeType = PostechClient.getMimeType(name);
+    const dataUri = `data:${mimeType};base64,${base64Content}`;
+
+    return {
+      id: id || name,
+      name,
+      url: dataUri,
+    };
+  }
+
+  /**
+   * Get MIME type from file extension.
+   */
+  private static getMimeType(filename: string): string {
+    const ext = filename.split('.').pop()?.toLowerCase() || '';
+    const mimeTypes: Record<string, string> = {
+      'ts': 'text/typescript',
+      'tsx': 'text/typescript',
+      'js': 'text/javascript',
+      'jsx': 'text/javascript',
+      'json': 'application/json',
+      'py': 'text/x-python',
+      'java': 'text/x-java',
+      'c': 'text/x-c',
+      'cpp': 'text/x-c++',
+      'h': 'text/x-c',
+      'go': 'text/x-go',
+      'rs': 'text/x-rust',
+      'md': 'text/markdown',
+      'txt': 'text/plain',
+      'html': 'text/html',
+      'css': 'text/css',
+      'xml': 'application/xml',
+      'yaml': 'application/x-yaml',
+      'yml': 'application/x-yaml',
+    };
+    return mimeTypes[ext] || 'text/plain';
+  }
+
+  /**
    * Simple query for a2 API endpoints (API key mode).
    * Uses simpler payload format: { message, stream, files }
    *
@@ -611,12 +665,14 @@ export class PostechClient {
    * @param message - The message to send
    * @param model - Model name ('gemini', 'gpt', 'claude')
    * @param stream - Whether to stream response (default: false)
+   * @param files - Optional files to attach (id, name, url)
    */
   async *streamQueryA2(
     apiKey: string,
     message: string,
     model: 'gemini' | 'gpt' | 'claude' = 'gemini',
-    stream: boolean = true
+    stream: boolean = true,
+    files: Array<{ id: string; name: string; url: string }> = []
   ): AsyncGenerator<StreamChunk> {
     // GPT: a1, Gemini: a2, Claude: a3
     const apiVersion = model === 'gpt' ? 1 : model === 'gemini' ? 2 : 3;
@@ -627,7 +683,7 @@ export class PostechClient {
     const payload = {
       message,
       stream,
-      files: [],
+      files,
     };
     const bodyStr = JSON.stringify(payload);
 
