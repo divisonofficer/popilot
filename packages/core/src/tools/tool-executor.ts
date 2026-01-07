@@ -53,6 +53,12 @@ export class ToolExecutor {
     'run_terminal_command',
     'list_directory',
     'tree',
+    // Git tools
+    'git.status',
+    'git.diff',
+    'git.log',
+    'git.restore',
+    'git.show',
   ]);
 
   constructor(config: ToolExecutorConfig) {
@@ -109,6 +115,22 @@ export class ToolExecutor {
           break;
         case 'file.applyTextEdits':
           result = await this.execApplyEdits(args);
+          break;
+        // Git tools
+        case 'git.status':
+          result = await this.execGitStatus(args);
+          break;
+        case 'git.diff':
+          result = await this.execGitDiff(args);
+          break;
+        case 'git.log':
+          result = await this.execGitLog(args);
+          break;
+        case 'git.restore':
+          result = await this.execGitRestore(args);
+          break;
+        case 'git.show':
+          result = await this.execGitShow(args);
           break;
         default:
           result = `[Error] Unknown tool: ${toolName}`;
@@ -1128,6 +1150,285 @@ edit_file requires the COMPLETE file content. Please:
       }
       throw error;
     }
+  }
+
+  // =============================================================================
+  // Git Tools Implementation
+  // =============================================================================
+
+  /**
+   * Run a git command and return output.
+   */
+  private async runGitCommand(args: string[]): Promise<string> {
+    return new Promise((resolve) => {
+      const child = spawn('git', args, {
+        cwd: this.workspaceDir,
+        timeout: this.timeout,
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      child.stdout.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      child.stderr.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      child.on('close', (code) => {
+        if (code !== 0 && stderr) {
+          resolve(`[Error] ${stderr.trim()}`);
+        } else {
+          resolve(stdout.trim() || '(no output)');
+        }
+      });
+
+      child.on('error', (error) => {
+        resolve(`[Error] ${error.message}`);
+      });
+    });
+  }
+
+  /**
+   * git.status - Show changed files (staged/unstaged/untracked)
+   * Args: paths (optional array)
+   */
+  private async execGitStatus(args: Record<string, unknown>): Promise<string> {
+    const gitArgs = ['status', '--porcelain', '-uall'];
+
+    // Add specific paths if provided
+    const paths = args.paths as string[] | undefined;
+    if (paths && Array.isArray(paths) && paths.length > 0) {
+      gitArgs.push('--', ...paths);
+    }
+
+    const porcelainOutput = await this.runGitCommand(gitArgs);
+
+    if (porcelainOutput.startsWith('[Error]')) {
+      return porcelainOutput;
+    }
+
+    if (!porcelainOutput || porcelainOutput === '(no output)') {
+      return '[git.status] Working tree clean - no changes detected.';
+    }
+
+    // Parse porcelain output into readable format
+    const lines = porcelainOutput.split('\n').filter(Boolean);
+    const staged: string[] = [];
+    const unstaged: string[] = [];
+    const untracked: string[] = [];
+
+    for (const line of lines) {
+      const index = line[0];
+      const worktree = line[1];
+      const filepath = line.slice(3);
+
+      if (index === '?') {
+        untracked.push(filepath);
+      } else {
+        if (index !== ' ' && index !== '?') {
+          staged.push(`[${index}] ${filepath}`);
+        }
+        if (worktree !== ' ' && worktree !== '?') {
+          unstaged.push(`[${worktree}] ${filepath}`);
+        }
+      }
+    }
+
+    let result = '[git.status] Repository status:\n';
+    result += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+
+    if (staged.length > 0) {
+      result += `\n📦 Staged (${staged.length}):\n`;
+      result += staged.map(f => `  ${f}`).join('\n') + '\n';
+    }
+
+    if (unstaged.length > 0) {
+      result += `\n📝 Modified (${unstaged.length}):\n`;
+      result += unstaged.map(f => `  ${f}`).join('\n') + '\n';
+    }
+
+    if (untracked.length > 0) {
+      result += `\n❓ Untracked (${untracked.length}):\n`;
+      result += untracked.map(f => `  ${f}`).join('\n') + '\n';
+    }
+
+    result += '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━';
+    result += '\n[Tip] Use git.diff to see exact changes, git.restore to undo.';
+
+    return result;
+  }
+
+  /**
+   * git.diff - Show exact changes in files
+   * Args: filepath (optional), staged (boolean), ref (optional), contextLines (number)
+   */
+  private async execGitDiff(args: Record<string, unknown>): Promise<string> {
+    const gitArgs = ['diff'];
+
+    // Staged changes
+    const staged = args.staged as boolean | undefined;
+    if (staged) {
+      gitArgs.push('--cached');
+    }
+
+    // Reference (commit or branch)
+    const ref = args.ref as string | undefined;
+    if (ref) {
+      gitArgs.push(ref);
+    }
+
+    // Context lines
+    const contextLines = args.contextLines as number | undefined;
+    if (contextLines !== undefined && contextLines >= 0) {
+      gitArgs.push(`-U${contextLines}`);
+    }
+
+    // Specific file
+    const filepath = args.filepath as string | undefined;
+    if (filepath) {
+      gitArgs.push('--', this.resolvePath(filepath));
+    }
+
+    const output = await this.runGitCommand(gitArgs);
+
+    if (output.startsWith('[Error]')) {
+      return output;
+    }
+
+    if (!output || output === '(no output)') {
+      const target = staged ? 'staged' : 'unstaged';
+      const fileNote = filepath ? ` for ${filepath}` : '';
+      return `[git.diff] No ${target} changes${fileNote}.`;
+    }
+
+    // Add header
+    const target = staged ? 'Staged' : 'Unstaged';
+    const fileNote = filepath ? ` - ${filepath}` : '';
+    let result = `[git.diff] ${target} changes${fileNote}:\n`;
+    result += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+    result += output;
+
+    return result;
+  }
+
+  /**
+   * git.log - Show recent commit history
+   * Args: count (default: 10), filepath (optional), oneline (boolean)
+   */
+  private async execGitLog(args: Record<string, unknown>): Promise<string> {
+    const gitArgs = ['log'];
+
+    // Number of commits
+    const count = (args.count as number) || 10;
+    gitArgs.push(`-n`, String(count));
+
+    // Format
+    const oneline = args.oneline as boolean | undefined;
+    if (oneline) {
+      gitArgs.push('--oneline');
+    } else {
+      gitArgs.push('--format=%h %s (%an, %ar)');
+    }
+
+    // Specific file
+    const filepath = args.filepath as string | undefined;
+    if (filepath) {
+      gitArgs.push('--', this.resolvePath(filepath));
+    }
+
+    const output = await this.runGitCommand(gitArgs);
+
+    if (output.startsWith('[Error]')) {
+      return output;
+    }
+
+    if (!output || output === '(no output)') {
+      return '[git.log] No commits found.';
+    }
+
+    const fileNote = filepath ? ` for ${filepath}` : '';
+    let result = `[git.log] Recent ${count} commits${fileNote}:\n`;
+    result += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+    result += output;
+
+    return result;
+  }
+
+  /**
+   * git.restore - Restore file to previous state (UNDO changes)
+   * Args: filepath (required), staged (boolean), source (optional ref)
+   */
+  private async execGitRestore(args: Record<string, unknown>): Promise<string> {
+    const filepath = args.filepath as string | undefined;
+    if (!filepath) {
+      return '[Error] filepath is required for git.restore';
+    }
+
+    const gitArgs = ['restore'];
+
+    // Restore staged changes
+    const staged = args.staged as boolean | undefined;
+    if (staged) {
+      gitArgs.push('--staged');
+    }
+
+    // Source ref (commit/branch to restore from)
+    const source = args.source as string | undefined;
+    if (source) {
+      gitArgs.push('--source', source);
+    }
+
+    // Target file
+    gitArgs.push('--', this.resolvePath(filepath));
+
+    const output = await this.runGitCommand(gitArgs);
+
+    if (output.startsWith('[Error]')) {
+      return output;
+    }
+
+    const target = staged ? 'staged' : 'working tree';
+    return `[git.restore] Successfully restored ${filepath} in ${target}.`;
+  }
+
+  /**
+   * git.show - Show details of a specific commit
+   * Args: ref (required), filepath (optional), stat (boolean)
+   */
+  private async execGitShow(args: Record<string, unknown>): Promise<string> {
+    const ref = args.ref as string | undefined;
+    if (!ref) {
+      return '[Error] ref is required for git.show (e.g., "HEAD", "abc1234", "main")';
+    }
+
+    const gitArgs = ['show', ref];
+
+    // Show only stat (file list with changes summary)
+    const stat = args.stat as boolean | undefined;
+    if (stat) {
+      gitArgs.push('--stat');
+    }
+
+    // Specific file
+    const filepath = args.filepath as string | undefined;
+    if (filepath) {
+      gitArgs.push('--', this.resolvePath(filepath));
+    }
+
+    const output = await this.runGitCommand(gitArgs);
+
+    if (output.startsWith('[Error]')) {
+      return output;
+    }
+
+    let result = `[git.show] Commit ${ref}:\n`;
+    result += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+    result += output;
+
+    return result;
   }
 
   /**

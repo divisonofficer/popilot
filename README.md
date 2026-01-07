@@ -63,6 +63,17 @@ source ~/.bashrc
 
 ### Fish
 
+## 🛠️ 주요 변경사항 (request-transformer.ts 기준)
+
+- **POSTECH GenAI API 전용 메시지 변환기 추가**
+  - OpenAI 스타일 메시지를 POSTECH API 포맷으로 자동 변환
+  - 첨부파일, 다양한 메시지 타입 지원
+- **A2 API 대응**
+  - 입력/출력 길이 제한 상향, 최근 메시지 보존 개수 증가
+- **코드 리팩토링 및 주석 강화**
+  - 타입스크립트 기반 구조화, 상세 주석 추가
+
+> 자세한 구현 내용은 `packages/core/src/client/request-transformer.ts` 파일을 참고하세요.
 ```fish
 echo "alias popilot='node (pwd)/packages/cli/dist/index.js'" >> ~/.config/fish/config.fish
 ```

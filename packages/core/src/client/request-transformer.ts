@@ -664,7 +664,10 @@ You have access to the FULL content - do NOT summarize or truncate.`;
 
   /**
    * Sanitize text for API.
-   * Removes control characters and replaces backticks with Unicode lookalike.
+   * - Removes control characters
+   * - Removes emojis and special Unicode symbols
+   * - Keeps ASCII + Korean (Hangul) only
+   * - Replaces backticks with safe alternative
    */
   private sanitizeText(text: string): string {
     // Normalize line endings
@@ -673,11 +676,30 @@ You have access to the FULL content - do NOT summarize or truncate.`;
     // Remove control characters except newline and tab
     result = result.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
 
-    // Replace backticks with Unicode lookalike to avoid A2 API parsing issues
-    // ` (U+0060 GRAVE ACCENT) → ‵ (U+2035 REVERSED PRIME)
-    // This preserves visual appearance and model understanding while avoiding API errors
-    // Works for both inline code (`App.tsx`) and code blocks (```typescript)
-    result = result.replace(/`/g, '\u2035');
+    // Remove emojis and special Unicode symbols
+    // Covers: Emoticons, Misc Symbols, Dingbats, Transport, Flags, etc.
+    result = result.replace(
+      /[\u{1F300}-\u{1F9FF}]|[\u{1FA00}-\u{1FAFF}]|[\u{2600}-\u{26FF}]|[\u{2700}-\u{27BF}]|[\u{2300}-\u{23FF}]|[\u{2B50}-\u{2B55}]|[\u{FE00}-\u{FE0F}]|[\u{200D}]|[\u{20E3}]|[\u{1F000}-\u{1F02F}]|[\u{1F0A0}-\u{1F0FF}]/gu,
+      ''
+    );
+
+    // Remove box drawing and block elements (━, █, etc.) - replace with simple dashes
+    result = result.replace(/[\u{2500}-\u{257F}]|[\u{2580}-\u{259F}]/gu, '-');
+
+    // Remove other miscellaneous symbols that aren't standard punctuation
+    // Keep: ASCII (0x20-0x7E), Korean (AC00-D7AF, 1100-11FF, 3130-318F), common punctuation
+    result = result.replace(
+      /[^\x09\x0A\x20-\x7E\uAC00-\uD7AF\u1100-\u11FF\u3130-\u318F\u00A0-\u00FF\u2018-\u201F\u2026\u2013-\u2014]/g,
+      ''
+    );
+
+    // Replace backticks with single quote to avoid A2 API parsing issues
+    // ` → ' (simpler and more compatible than Unicode lookalike)
+    result = result.replace(/`/g, "'");
+
+    // Clean up multiple consecutive spaces/dashes from removed characters
+    result = result.replace(/  +/g, ' ');
+    result = result.replace(/--+/g, '--');
 
     return result;
   }

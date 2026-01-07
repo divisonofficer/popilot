@@ -43,6 +43,21 @@ export interface AppProps {
 
 type AppState = 'idle' | 'streaming' | 'confirming' | 'authenticating' | 'executing_tool';
 
+// Tools that require confirmation before execution
+const CONFIRMATION_REQUIRED_TOOLS = [
+  'run_terminal_command',
+  'create_new_file',
+  'edit_file',
+  'file.applyTextEdits',
+] as const;
+
+// Valid patterns for autoconfirm (tools + special patterns)
+const VALID_AUTOCONFIRM_PATTERNS = [
+  ...CONFIRMATION_REQUIRED_TOOLS,
+  'file.*',  // Pattern for all file tools
+  'all',     // Global setting
+] as const;
+
 /**
  * User profile data from POSTECH API.
  */
@@ -271,6 +286,16 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
   // Ref for pending loop state during tool confirmation
   const pendingLoopStateRef = useRef<PendingLoopState | null>(null);
+
+  // Interrupt support - allows user to send new message while AI is responding
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const [interruptInput, setInterruptInput] = useState<string | null>(null);
+  const currentResponseRef = useRef<string>('');  // Track current response for interrupt
+
+  // Keep currentResponseRef in sync with currentResponse for interrupt handling
+  useEffect(() => {
+    currentResponseRef.current = currentResponse;
+  }, [currentResponse]);
 
   // Initialize services
   useEffect(() => {
@@ -681,7 +706,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             }
 
             // Check if confirmation needed
-            const needsConfirmation = ['run_terminal_command', 'create_new_file', 'edit_file', 'file.applyTextEdits'].includes(toolCall.toolName);
+            const needsConfirmation = CONFIRMATION_REQUIRED_TOOLS.includes(toolCall.toolName as typeof CONFIRMATION_REQUIRED_TOOLS[number]);
 
             if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName)) {
               // Save loop state for resumption after confirmation
@@ -796,6 +821,51 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     }
   }, [state, messages, currentModel, initializeChatRoom, shouldAutoConfirm]);
 
+  // Handle interrupt - user sends new message while AI is responding
+  const handleInterrupt = useCallback((input: string) => {
+    if (state !== 'streaming') return;
+    if (!input.trim()) return;
+
+    // Abort current request
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+
+    // Save the interrupt input to be processed after current response stops
+    setInterruptInput(input);
+
+    // Add partial response to history if any
+    const partialResponse = currentResponseRef.current;
+    if (partialResponse && partialResponse.trim()) {
+      const partialMessage: Message = {
+        role: 'assistant',
+        content: sanitizeBackticks(partialResponse + '\n\n[응답 중단됨]'),
+      };
+      setMessages((prev) => [...prev, partialMessage]);
+      servicesRef.current?.sessionService.addMessage(partialMessage);
+    }
+
+    // Reset state
+    setState('idle');
+    setCurrentResponse('');
+    setCurrentTool(null);
+    pendingLoopStateRef.current = null;
+    currentResponseRef.current = '';
+  }, [state]);
+
+  // Process interrupt input when state becomes idle
+  useEffect(() => {
+    if (state === 'idle' && interruptInput) {
+      const input = interruptInput;
+      setInterruptInput(null);
+      // Use setTimeout to ensure state update is complete
+      setTimeout(() => {
+        handleSubmit(input);
+      }, 50);
+    }
+  }, [state, interruptInput, handleSubmit]);
+
   // Handle slash commands
   const handleSlashCommand = useCallback((input: string) => {
     const parts = input.slice(1).split(/\s+/);
@@ -880,11 +950,12 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         // /autoconfirm all on|off - set global default
         // /autoconfirm reset - clear all settings
         if (!args[0]) {
-          // Show current settings
+          // Show current settings and available tools
           const settings = Object.entries(autoConfirmSettings);
+          const toolList = VALID_AUTOCONFIRM_PATTERNS.join(', ');
           const msg = settings.length === 0
-            ? '자동승인 설정 없음 (모든 도구 수동 확인)\n\n사용법:\n  /autoconfirm <tool> on|off\n  /autoconfirm file.* on\n  /autoconfirm all on\n  /autoconfirm reset'
-            : '자동승인 설정:\n' + settings.map(([k, v]) => `  ${k}: ${v ? 'ON' : 'OFF'}`).join('\n');
+            ? `자동승인 설정 없음 (모든 도구 수동 확인)\n\n사용 가능한 도구: ${toolList}\n\n사용법:\n  /autoconfirm <tool> on|off\n  /autoconfirm file.* on\n  /autoconfirm all on\n  /autoconfirm reset`
+            : `자동승인 설정:\n${settings.map(([k, v]) => `  ${k}: ${v ? 'ON' : 'OFF'}`).join('\n')}\n\n사용 가능한 도구: ${toolList}`;
           setMessages((prev) => [...prev, {
             role: 'assistant',
             content: `[SYSTEM] ${msg}`,
@@ -897,6 +968,18 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
           }]);
         } else {
           const toolName = args[0];
+
+          // Validate tool name
+          const isValidTool = VALID_AUTOCONFIRM_PATTERNS.includes(toolName as typeof VALID_AUTOCONFIRM_PATTERNS[number]);
+          if (!isValidTool) {
+            const toolList = VALID_AUTOCONFIRM_PATTERNS.join(', ');
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] 잘못된 도구: "${toolName}"\n\n사용 가능한 도구: ${toolList}`,
+            }]);
+            break;
+          }
+
           const value = args[1]?.toLowerCase();
           if (value === 'on' || value === 'off' || value === 'true' || value === 'false') {
             const enabled = value === 'on' || value === 'true';
@@ -1093,7 +1176,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       }
 
       default:
-setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 시작합니다.\n2. 주요 명령어 사용법:\n   - /help : 모든 명령어와 사용법 안내를 출력합니다.\n     예시) /help\n   - /exit : 프로그램을 종료합니다.\n     예시) /exit\n   - /clear : 대화 내용을 초기화합니다.\n     예시) /clear\n   - /model <모델명> : 사용할 AI 모델을 변경합니다.\n     예시) /model gpt-4o\n   - /config : 현재 설정을 확인합니다.\n     예시) /config\n\n3. 명령어 입력 방법:\n   - 반드시 슬래시(/)로 시작하세요.\n   - 각 명령어 뒤에 필요한 인자를 입력하세요.\n   - 예시) /model gpt-4o\n\n4. 공식 문서에서 각 명령어의 상세 설명을 확인할 수 있습니다.\n\n더 궁금한 점이 있으면 언제든 /help를 입력하세요. 😊`);
+setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(/) 커맨드를 사용할 수 있습니다.\n\n| 커맨드         | 설명 |\n| -------------- | ------------------------------------------------------------ |\n| /run <명령>    | 명령을 실행합니다. 예: /run ls -al |\n| /help          | 사용 가능한 커맨드와 도움말을 표시합니다. |\n| /clear         | 입력 프롬프트를 초기화합니다. |\n| /history       | 최근 실행한 명령어 목록을 보여줍니다. |\n| /exit          | CLI를 종료합니다. |\n| /model <모델명>| 사용할 AI 모델을 변경합니다. 예: /model gpt-4o |\n| /config        | 현재 설정을 확인합니다. |\n| /upload <파일> | 파일을 업로드합니다. 예: /upload report.pdf |\n| /download <파일>| 파일을 다운로드합니다. 예: /download result.txt |\n| /auth <방식>   | 인증 방식을 변경합니다. 예: /auth sso |\n| /token <토큰>  | API 토큰을 설정합니다. |\n\n> **TIP:** 입력창에 '/'를 입력하면 자동완성 기능이 활성화되어 사용 가능한 커맨드를 쉽게 확인할 수 있습니다.\n\n자세한 설명은 공식 문서를 참고하세요. 궁금한 점이 있으면 언제든 /help를 입력하세요. 😊`);
     }
   }, [exit, messages, autoConfirmSettings, authMode]);
 
@@ -1282,7 +1365,7 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
         }
 
         // Check if confirmation needed
-        const needsConfirmation = ['run_terminal_command', 'create_new_file', 'edit_file', 'file.applyTextEdits'].includes(toolCall.toolName);
+        const needsConfirmation = CONFIRMATION_REQUIRED_TOOLS.includes(toolCall.toolName as typeof CONFIRMATION_REQUIRED_TOOLS[number]);
 
         if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName)) {
           // Save updated loop state and wait for confirmation
@@ -1466,7 +1549,7 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
             }
 
             // Check if confirmation needed
-            const needsConfirmation = ['run_terminal_command', 'create_new_file', 'edit_file', 'file.applyTextEdits'].includes(toolCall.toolName);
+            const needsConfirmation = CONFIRMATION_REQUIRED_TOOLS.includes(toolCall.toolName as typeof CONFIRMATION_REQUIRED_TOOLS[number]);
 
             if (needsConfirmation && !shouldAutoConfirm(toolCall.toolName)) {
               // Save loop state and wait for confirmation
@@ -1596,9 +1679,9 @@ setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 �
 
       {state !== 'confirming' && (
         <InputPrompt
-          onSubmit={handleSubmit}
-          disabled={state !== 'idle'}
-          placeholder={state === 'streaming' ? 'AI가 응답 중...' : '메시지를 입력하세요 (/help)'}
+          onSubmit={state === 'streaming' ? handleInterrupt : handleSubmit}
+          disabled={state === 'executing_tool'}
+          placeholder={state === 'streaming' ? '메시지 입력으로 중단 (Esc도 가능)' : '메시지를 입력하세요 (/help)'}
         />
       )}
 
