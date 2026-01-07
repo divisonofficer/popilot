@@ -199,6 +199,8 @@ export interface ToolResult {
   name: string;
   result: string;
   success: boolean;
+  /** Optional file attachment for large file.read results */
+  fileAttachment?: FileAttachment;
 }
 
 // ============================================

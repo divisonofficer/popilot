@@ -25,6 +25,7 @@ import {
   type ChatRoomInfo,
   type TransformerConfig,
   type AuthMode,
+  type FileAttachment,
 } from '@popilot/core';
 import { Header } from './ui/Header.js';
 import { ChatView } from './ui/ChatView.js';
@@ -218,6 +219,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
   const [autoConfirm, setAutoConfirm] = useState(false);
   const [pendingResume, setPendingResume] = useState(false);
   const [authMode, setAuthMode] = useState<AuthMode>('apikey');
+  const [pendingFileAttachments, setPendingFileAttachments] = useState<FileAttachment[]>([]);
 
   // Refs for services (initialized once)
   const servicesRef = useRef<{
@@ -459,7 +461,14 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
         // Transform messages to POSTECH API format (includes system prompt with tools)
         const transformResult = transformer.transform(conversationMessages);
-        const { message: text, files: fileAttachments } = transformResult;
+        const { message: text, files: transformerFiles } = transformResult;
+
+        // Combine transformer files with pending file attachments from tool results
+        const fileAttachments = [...transformerFiles, ...pendingFileAttachments];
+        // Clear pending attachments after combining (they'll be sent with this request)
+        if (pendingFileAttachments.length > 0) {
+          setPendingFileAttachments([]);
+        }
 
         // Stream response - just accumulate, don't parse during streaming
         setState('streaming');
@@ -620,6 +629,11 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
             // Log tool result
             logger.logToolResult(iteration, toolCall.toolName, toolCall.args, result.result);
+
+            // Collect file attachment if present (for large file.read results)
+            if (result.fileAttachment) {
+              setPendingFileAttachments(prev => [...prev, result.fileAttachment!]);
+            }
 
             // Add summarized output to display response
             const summary = summarizeToolOutput(toolCall.toolName, toolCall.args, result.result);
@@ -964,7 +978,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       }
 
       default:
-        setError(`알 수 없는 명령어: /${cmd}.\n\n[Popilot CLI 도움말]\n\n- /help : 모든 명령어와 사용법 안내를 출력합니다.\n    예시) /help\n    → 모든 명령어와 상세 설명을 확인할 수 있습니다.\n- /exit : 프로그램을 종료합니다.\n    예시) /exit\n    → Popilot CLI를 종료합니다.\n- /clear : 대화 내용을 초기화합니다.\n    예시) /clear\n    → 이전 대화 기록이 모두 삭제됩니다.\n- /model <모델명> : 사용할 AI 모델을 변경합니다.\n    예시) /model gpt-4o\n    → 현재 대화에 사용할 AI 모델을 gpt-4o로 변경합니다.\n- /config : 현재 설정을 확인합니다.\n    예시) /config\n    → 현재 적용된 모델, 환경설정 등 정보를 확인할 수 있습니다.\n\n명령어는 반드시 슬래시(/)로 시작해야 하며, 각 명령어에 대한 자세한 사용법은 공식 문서를 참고하세요!\n\n예시) /model gpt-4o\n\n더 궁금한 점이 있으면 언제든 /help를 입력하세요. 😊`);
+setError(`\n[Popilot CLI 도움말]\n\n1. 모든 명령어는 슬래시(/)로 시작합니다.\n2. 주요 명령어 사용법:\n   - /help : 모든 명령어와 사용법 안내를 출력합니다.\n     예시) /help\n   - /exit : 프로그램을 종료합니다.\n     예시) /exit\n   - /clear : 대화 내용을 초기화합니다.\n     예시) /clear\n   - /model <모델명> : 사용할 AI 모델을 변경합니다.\n     예시) /model gpt-4o\n   - /config : 현재 설정을 확인합니다.\n     예시) /config\n\n3. 명령어 입력 방법:\n   - 반드시 슬래시(/)로 시작하세요.\n   - 각 명령어 뒤에 필요한 인자를 입력하세요.\n   - 예시) /model gpt-4o\n\n4. 공식 문서에서 각 명령어의 상세 설명을 확인할 수 있습니다.\n\n더 궁금한 점이 있으면 언제든 /help를 입력하세요. 😊`);
     }
   }, [exit, messages, autoConfirm, authMode]);
 
@@ -1040,6 +1054,11 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
       // Log tool result
       logger.logToolResult(loopState.iteration, pendingToolCall.name, pendingToolCall.args, result.result);
+
+      // Collect file attachment if present (for large file.read results)
+      if (result.fileAttachment) {
+        setPendingFileAttachments(prev => [...prev, result.fileAttachment!]);
+      }
 
       // Add summarized output to display response
       const summary = summarizeToolOutput(pendingToolCall.name, pendingToolCall.args, result.result);
@@ -1173,6 +1192,11 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         // Log tool result
         logger.logToolResult(iteration, toolCall.toolName, toolCall.args, result.result);
 
+        // Collect file attachment if present (for large file.read results)
+        if (result.fileAttachment) {
+          setPendingFileAttachments(prev => [...prev, result.fileAttachment!]);
+        }
+
         // Add summarized output to display response
         const summary = summarizeToolOutput(toolCall.toolName, toolCall.args, result.result);
         fullDisplayResponse += summary + '\n';
@@ -1197,7 +1221,14 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
         // Transform messages to POSTECH API format
         const transformResult = transformer.transform(conversationMessages);
-        const { message: text, files: fileAttachments } = transformResult;
+        const { message: text, files: transformerFiles } = transformResult;
+
+        // Combine transformer files with pending file attachments from tool results
+        const fileAttachments = [...transformerFiles, ...pendingFileAttachments];
+        // Clear pending attachments after combining
+        if (pendingFileAttachments.length > 0) {
+          setPendingFileAttachments([]);
+        }
 
         // Stream response
         setState('streaming');
@@ -1311,6 +1342,11 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
 
             // Log tool result
             logger.logToolResult(iteration, toolCall.toolName, toolCall.args, result.result);
+
+            // Collect file attachment if present (for large file.read results)
+            if (result.fileAttachment) {
+              setPendingFileAttachments(prev => [...prev, result.fileAttachment!]);
+            }
 
             // Add summarized output
             const summary = summarizeToolOutput(toolCall.toolName, toolCall.args, result.result);

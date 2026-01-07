@@ -9,7 +9,11 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { spawn, execSync } from 'node:child_process';
-import type { ToolDefinition, ToolResult } from '../types.js';
+import type { ToolDefinition, ToolResult, FileAttachment } from '../types.js';
+import { contentToDataUrl } from '../types.js';
+
+// Threshold for file attachment (chars) - files larger than this get uploaded
+const FILE_ATTACHMENT_THRESHOLD = 2000;
 
 export interface ToolExecutorConfig {
   workspaceDir: string;
@@ -71,12 +75,16 @@ export class ToolExecutor {
 
     try {
       let result: string;
+      let fileAttachment: FileAttachment | undefined;
 
       switch (toolName) {
         case 'read_file':
-        case 'file.read':
-          result = await this.execReadFile(args);
+        case 'file.read': {
+          const readResult = await this.execReadFile(args);
+          result = readResult.result;
+          fileAttachment = readResult.fileAttachment;
           break;
+        }
         case 'run_terminal_command':
           result = await this.execTerminalCommand(args);
           break;
@@ -111,6 +119,7 @@ export class ToolExecutor {
         name: toolName,
         result,
         success: !result.startsWith('[Error]'),
+        fileAttachment,
       };
     } catch (error) {
       return {
@@ -230,31 +239,72 @@ export class ToolExecutor {
 
   /**
    * Read file contents.
+   * Returns result string and optional file attachment for large files.
    */
-  private async execReadFile(args: Record<string, unknown>): Promise<string> {
+  private async execReadFile(args: Record<string, unknown>): Promise<{ result: string; fileAttachment?: FileAttachment }> {
     const inputPath = String(args.filepath ?? '');
 
     // Validate filepath first
     const pathValidation = this.validateFilePath(inputPath);
     if (!pathValidation.valid) {
-      return `[Error] Invalid filepath: ${pathValidation.error}\n\nTip: Use find_files tool first to get the exact file path, then use that path here.`;
+      return {
+        result: `[Error] Invalid filepath: ${pathValidation.error}\n\nTip: Use find_files tool first to get the exact file path, then use that path here.`,
+      };
     }
 
     // Try auto-correction if file doesn't exist
     const autoCorrect = this.tryAutoCorrectPath(inputPath);
     const filepath = autoCorrect ? this.resolvePath(autoCorrect.corrected) : this.resolvePath(inputPath);
     const correctionNote = autoCorrect
-      ? `[Auto-corrected] ${autoCorrect.originalPath} -> ${autoCorrect.corrected}\n\n`
+      ? `[Auto-corrected] ${autoCorrect.originalPath} -> ${autoCorrect.corrected}\n`
       : '';
 
     try {
       const content = await fs.promises.readFile(filepath, 'utf-8');
       const sha256 = crypto.createHash('sha256').update(content).digest('hex');
       const lines = content.split('\n');
-      return `${correctionNote}SHA256: ${sha256}\nLines: ${lines.length}\n\n${content}`;
+      const filename = path.basename(filepath);
+
+      // Check if file is large enough to warrant attachment
+      if (content.length >= FILE_ATTACHMENT_THRESHOLD) {
+        // Large file: create attachment and return metadata
+        const fileId = `file_${Date.now()}`;
+        const fileAttachment: FileAttachment = {
+          id: fileId,
+          name: filename,
+          url: contentToDataUrl(content, filename),
+        };
+
+        // Include line numbers in the content for the attachment
+        const numberedContent = lines.map((line, i) => `${String(i + 1).padStart(String(lines.length).length, ' ')}| ${line}`).join('\n');
+        fileAttachment.url = contentToDataUrl(numberedContent, filename);
+
+        const result = `${correctionNote}[file.read SUCCESS] ${filepath}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHA256: ${sha256}
+Total lines: ${lines.length}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📎 FILE UPLOADED: ${filename} (${content.length} chars)
+
+The COMPLETE file content has been uploaded as an attachment.
+You have access to the FULL content - do NOT summarize or say "file is too long".
+
+Use SHA256 above for file.applyTextEdits when modifying this file.
+
+Preview (first 20 lines):
+${lines.slice(0, 20).map((line, i) => `${String(i + 1).padStart(4, ' ')}| ${line}`).join('\n')}${lines.length > 20 ? '\n...' : ''}`;
+
+        return { result, fileAttachment };
+      }
+
+      // Small file: include full content inline
+      return {
+        result: `${correctionNote}SHA256: ${sha256}\nLines: ${lines.length}\n\n${content}`,
+      };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        return this.buildFileNotFoundError(filepath);
+        return { result: this.buildFileNotFoundError(filepath) };
       }
       throw error;
     }

@@ -297,6 +297,27 @@ END_ARG
 1. Do NOT write [Tool Result]: yourself - system provides it
 2. Do NOT fake results like "Done" or "Successfully applied"
 3. After file.read, MUST use file.applyTextEdits
+
+# [!!!] FILE CONTENT HANDLING - NO ARBITRARY SUMMARIZATION [!!!]
+
+When you receive file.read results (either inline or as attached files):
+
+1. ALWAYS work with the FULL file content provided
+2. Do NOT summarize or truncate file contents in your response
+3. If a file is attached, the system has ALREADY processed it for you - use it!
+4. Do NOT say "파일이 너무 길어서 일부만 표시합니다" or similar - show what's needed
+5. If you need to reference specific lines, cite the exact line numbers from file.read
+
+[X] FORBIDDEN responses about file content:
+- "This file is too long, showing only part of it" - NO!
+- "Let me summarize the key parts" - NO! (unless user explicitly asks)
+- "Due to length, I'll skip some sections" - NO!
+
+[O] CORRECT behavior:
+- Read the full attached file content
+- Reference specific line numbers when discussing code
+- If user asks for specific sections, use startLine/endLine in file.read
+- Work with the complete information provided
 `;
 
 function generateUserWrapperPrefix(hardLimit: number): string {
@@ -539,10 +560,25 @@ export class RequestTransformer {
    * Large file.read results are extracted as file attachments if enabled.
    */
   private formatToolResult(content: string): string {
-    // Check if this is a file.read result (has SHA256 and file path pattern)
-    const isFileRead = content.includes('SHA256:');
-    const filePathMatch = content.match(/File:\s*(.+?)(?:\s*\(|$|\n)/);
-    const sha256Match = content.match(/SHA256:\s*([a-f0-9]+)/i);
+    // Try to parse as JSON (file.read returns JSON format)
+    let parsed: {
+      sha256?: string;
+      filePath?: string;
+      content?: string;
+      totalLines?: number;
+    } | null = null;
+
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      // Not JSON - use text patterns
+    }
+
+    // Check if this is a file.read result
+    const isFileRead = parsed?.sha256 || content.includes('"sha256"');
+    const sha256 = parsed?.sha256 ?? content.match(/"sha256":\s*"([a-f0-9]+)"/i)?.[1];
+    const filepath = parsed?.filePath ?? content.match(/"filePath":\s*"([^"]+)"/)?.[1];
+    const fileContent = parsed?.content ?? content.match(/"content":\s*"([\s\S]*?)"\s*\}/)?.[1];
 
     // Extract file.read results as attachments if:
     // 1. File attachment extraction is enabled
@@ -551,33 +587,43 @@ export class RequestTransformer {
     if (
       this.extractFileAttachments &&
       isFileRead &&
-      filePathMatch &&
+      filepath &&
+      sha256 &&
       content.length >= this.minFileAttachmentSize
     ) {
-      const filepath = filePathMatch[1].trim();
       const filename = filepath.split('/').pop() ?? 'file.txt';
-      const sha256 = sha256Match ? sha256Match[1] : '';
 
-      // Extract the actual file content (after the header lines)
-      const contentStartMatch = content.match(/---+\n([\s\S]*)/);
-      const fileContent = contentStartMatch ? contentStartMatch[1] : content;
+      // For file content, unescape JSON string if needed
+      let actualContent = fileContent ?? content;
+      if (typeof actualContent === 'string' && actualContent.includes('\\n')) {
+        actualContent = actualContent.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"');
+      }
 
       // Create file attachment
       const fileId = `file_${++this.fileIdCounter}`;
       const attachment: FileAttachment = {
         id: fileId,
         name: filename,
-        url: contentToDataUrl(fileContent, filename),
+        url: contentToDataUrl(actualContent, filename),
       };
       this.fileAttachments.push(attachment);
 
-      // Return a reference to the attached file (keeps SHA256 for file.applyTextEdits)
-      return `[Tool Result - file.read]: ${filepath}
-SHA256: ${sha256}
-[File attached as: ${filename} (id: ${fileId})]
-Total lines: ${fileContent.split('\n').length}
+      const totalLines = parsed?.totalLines ?? actualContent.split('\n').length;
 
-[!] Full content is in the attached file. Use the SHA256 above for file.applyTextEdits.`;
+      // Return a reference to the attached file (keeps SHA256 for file.applyTextEdits)
+      // Make it VERY clear that the full file is attached and available
+      return `[Tool Result - file.read SUCCESS]: ${filepath}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SHA256: ${sha256}
+Total lines: ${totalLines}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📎 FILE UPLOADED: ${filename} (id: ${fileId})
+
+The COMPLETE file content (${actualContent.length} chars) has been uploaded as an attachment.
+You have access to the FULL content - do NOT summarize or say "file is too long".
+
+Use SHA256 above for file.applyTextEdits when modifying this file.`;
     }
 
     // Small content - include directly
@@ -585,18 +631,33 @@ Total lines: ${fileContent.split('\n').length}
       return `[Tool Result]: ${content}`;
     }
 
-    // Large content but not extractable as file - truncate with SHA256 preserved
-    if (isFileRead && sha256Match) {
-      const sha256Line = `SHA256: ${sha256Match[1]}`;
-      const remainingBudget = this.maxToolOutputLength - sha256Line.length - 100;
-      const preview = content.slice(0, Math.max(0, remainingBudget));
+    // Large content but not extractable as file - this shouldn't happen often
+    // If filepath/sha256 parsing failed, still try to attach as generic file
+    if (isFileRead) {
+      // Try to extract any content we can
+      const genericFilename = 'file_content.txt';
+      const fileId = `file_${++this.fileIdCounter}`;
+      const attachment: FileAttachment = {
+        id: fileId,
+        name: genericFilename,
+        url: contentToDataUrl(content, genericFilename),
+      };
+      this.fileAttachments.push(attachment);
 
-      return `[Tool Result]: ${sha256Line}\n\n${preview}...\n\n[!] Content truncated (${content.length} chars). Use file.read with startLine/endLine for specific sections.`;
+      return `[Tool Result - file.read]: Large file content
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${sha256 ? `SHA256: ${sha256}` : '(SHA256 not parsed)'}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📎 FILE UPLOADED: ${genericFilename} (id: ${fileId})
+
+The COMPLETE content (${content.length} chars) has been uploaded as an attachment.
+You have access to the FULL content - do NOT summarize or truncate.`;
     }
 
-    // Regular tool output - just truncate
+    // Regular tool output (non-file) - truncate with clear indication
     const truncated = content.slice(0, this.maxToolOutputLength);
-    return `[Tool Result]: ${truncated}... (${content.length} chars total)`;
+    return `[Tool Result]: ${truncated}...\n\n[Note: Output truncated from ${content.length} chars]`;
   }
 
   /**
