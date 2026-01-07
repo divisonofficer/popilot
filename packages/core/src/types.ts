@@ -238,6 +238,58 @@ export const DEFAULT_CONFIG: PopilotConfig = {
 };
 
 // ============================================
+// File Attachment Types (A2 API)
+// ============================================
+
+/**
+ * File attachment for A2 API.
+ * Files are sent separately from the main prompt.
+ */
+export interface FileAttachment {
+  /** Unique identifier for the file */
+  id: string;
+  /** Display name for the file */
+  name: string;
+  /** Base64 data URL or actual URL */
+  url: string;
+}
+
+/**
+ * Convert file content to base64 data URL.
+ */
+export function contentToDataUrl(content: string, filename: string): string {
+  // Determine MIME type from extension
+  const ext = filename.split('.').pop()?.toLowerCase() ?? '';
+  const mimeTypes: Record<string, string> = {
+    ts: 'text/typescript',
+    tsx: 'text/typescript',
+    js: 'text/javascript',
+    jsx: 'text/javascript',
+    json: 'application/json',
+    md: 'text/markdown',
+    py: 'text/x-python',
+    rs: 'text/x-rust',
+    go: 'text/x-go',
+    java: 'text/x-java',
+    cpp: 'text/x-c++',
+    c: 'text/x-c',
+    h: 'text/x-c',
+    css: 'text/css',
+    html: 'text/html',
+    xml: 'text/xml',
+    yaml: 'text/yaml',
+    yml: 'text/yaml',
+    sh: 'text/x-shellscript',
+    txt: 'text/plain',
+  };
+  const mimeType = mimeTypes[ext] ?? 'text/plain';
+
+  // Encode to base64
+  const base64 = Buffer.from(content, 'utf-8').toString('base64');
+  return `data:${mimeType};base64,${base64}`;
+}
+
+// ============================================
 // Event Types
 // ============================================
 

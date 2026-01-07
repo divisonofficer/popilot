@@ -9,6 +9,7 @@ import {
   type StreamChunk,
   type UserInfo,
   type SSEData,
+  type FileAttachment,
 } from '../types.js';
 
 export class PostechClientError extends Error {
@@ -665,14 +666,14 @@ export class PostechClient {
    * @param message - The message to send
    * @param model - Model name ('gemini', 'gpt', 'claude')
    * @param stream - Whether to stream response (default: false)
-   * @param files - Optional files to attach (id, name, url)
+   * @param files - Optional file attachments (extracted from file.read results)
    */
   async *streamQueryA2(
     apiKey: string,
     message: string,
     model: 'gemini' | 'gpt' | 'claude' = 'gemini',
     stream: boolean = true,
-    files: Array<{ id: string; name: string; url: string }> = []
+    files: FileAttachment[] = []
   ): AsyncGenerator<StreamChunk> {
     // GPT: a1, Gemini: a2, Claude: a3
     const apiVersion = model === 'gpt' ? 1 : model === 'gemini' ? 2 : 3;
@@ -691,6 +692,9 @@ export class PostechClient {
     console.log(`URL: ${a2Url}`);
     console.log(`Model: ${model}`);
     console.log(`Message: ${message.slice(0, 100)}...`);
+    if (files.length > 0) {
+      console.log(`Files attached: ${files.length} (${files.map(f => f.name).join(', ')})`);
+    }
     console.log('======================\n');
 
     try {

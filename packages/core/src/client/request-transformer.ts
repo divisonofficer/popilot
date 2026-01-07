@@ -5,7 +5,8 @@
  * TypeScript port of continuedev/src/transform/request_transformer.py
  */
 
-import type { Message, ContentPart } from '../types.js';
+import type { Message, ContentPart, FileAttachment } from '../types.js';
+import { contentToDataUrl } from '../types.js';
 
 // Default configuration constants
 // A2 API has more generous limits AND no thread/history, so we keep more context
@@ -28,6 +29,20 @@ export interface TransformerConfig {
   keepRecentMessages?: number;
   /** Model provider for provider-specific prompts (default: 'anthropic') */
   modelProvider?: 'anthropic' | 'azure' | 'google';
+  /** Extract file.read results as separate file attachments (default: true) */
+  extractFileAttachments?: boolean;
+  /** Minimum file size to extract as attachment (default: 2000 chars) */
+  minFileAttachmentSize?: number;
+}
+
+/**
+ * Result of transform() - includes both message and file attachments.
+ */
+export interface TransformerResult {
+  /** The transformed message text */
+  message: string;
+  /** File attachments extracted from tool results (for A2 API files field) */
+  files: FileAttachment[];
 }
 
 /**
@@ -44,6 +59,7 @@ Do NOT say "I cannot execute tools" - you CAN and MUST use them!
 `;
 
 // MCP Tool System Prompt - All available tools for file operations
+// NOTE: Using [CODE]tool format instead of backticks to avoid JSON parsing issues with A2 API
 const MCP_TOOL_PROMPT = `
 === Popilot Tool System ===
 
@@ -57,12 +73,12 @@ You are a coding agent that directly modifies code. Do NOT explain - EXECUTE!
 
 YOU MUST USE THIS EXACT FORMAT. NO OTHER FORMAT WILL WORK!
 
-\`\`\`tool
+[CODE]tool
 TOOL_NAME: toolname
 BEGIN_ARG: argname
 value
 END_ARG
-\`\`\`
+[CODE]
 
 [X] WRONG FORMATS (WILL NOT WORK):
 - <!-- tools: xxx --> (HTML comments don't work!)
@@ -71,12 +87,12 @@ END_ARG
 - function_call: xxx (function call syntax doesn't work!)
 
 [O] ONLY THIS FORMAT WORKS:
-\`\`\`tool
+[CODE]tool
 TOOL_NAME: find_files
 BEGIN_ARG: query
 apptsx
 END_ARG
-\`\`\`
+[CODE]
 
 # Available tools:
 
@@ -146,7 +162,7 @@ Insert new code without deleting existing lines - SAFEST approach!
 - [!] If you include endLine, it becomes REPLACE mode!
 
 Example: Add import at line 5
-\`\`\`tool
+[CODE]tool
 TOOL_NAME: file.applyTextEdits
 BEGIN_ARG: filepath
 packages/cli/src/App.tsx
@@ -157,7 +173,7 @@ END_ARG
 BEGIN_ARG: edits
 [{ "startLine": 5, "newText": "import { newModule } from './newModule';" }]
 END_ARG
-\`\`\`
+[CODE]
 
 ### REPLACE MODE (use only when necessary)
 Only use when you MUST delete existing lines:
@@ -166,7 +182,7 @@ Only use when you MUST delete existing lines:
 - Single line replace: startLine === endLine
 
 Example: Replace lines 15-17
-\`\`\`tool
+[CODE]tool
 TOOL_NAME: file.applyTextEdits
 BEGIN_ARG: filepath
 packages/cli/src/App.tsx
@@ -177,7 +193,7 @@ END_ARG
 BEGIN_ARG: edits
 [{ "startLine": 15, "endLine": 17, "newText": "// Fixed code", "anchor": { "expectedText": "buggy code" } }]
 END_ARG
-\`\`\`
+[CODE]
 
 ### CRITICAL RULES:
 1. PREFER INSERT over REPLACE when possible
@@ -225,6 +241,52 @@ END_ARG
 - Need more? Call in next response after getting results
 - Complex edits: break into multiple file.applyTextEdits calls
 
+# [!!!] GIT TOOLS - Track Your Changes [!!!]
+
+Use git tools to track what you've modified and recover from mistakes!
+
+## Available Git Tools:
+
+10. git.status - Show changed files (staged/unstaged/untracked)
+    Args: paths (optional array)
+    [!] Use this to see what files you've modified!
+
+11. git.diff - Show exact changes in files
+    Args: filepath (optional), staged (boolean), ref (optional), contextLines (number)
+    [!] Use this to review your modifications before/after editing!
+
+12. git.log - Show recent commit history
+    Args: count (default: 10), filepath (optional), oneline (boolean)
+
+13. git.restore - Restore file to previous state (UNDO changes)
+    Args: filepath (required), staged (boolean), source (optional ref)
+    [!] Use this to undo a bad edit!
+
+14. git.show - Show details of a specific commit
+    Args: ref (required), filepath (optional), stat (boolean)
+
+## Git Workflow for Safe Editing:
+
+1. BEFORE editing: git.status to see current state
+2. AFTER editing: git.diff to verify your changes
+3. IF mistake: git.restore to undo changes
+
+Example: Check what you changed
+[CODE]tool
+TOOL_NAME: git.diff
+BEGIN_ARG: filepath
+packages/core/src/client/postech-client.ts
+END_ARG
+[CODE]
+
+Example: Undo a bad edit
+[CODE]tool
+TOOL_NAME: git.restore
+BEGIN_ARG: filepath
+packages/core/src/client/postech-client.ts
+END_ARG
+[CODE]
+
 # [!!!] FORBIDDEN behaviors [!!!]
 1. "Please provide file path" - FORBIDDEN! Use tree/find_files
 2. "Please upload file" - FORBIDDEN! Use file.read
@@ -251,6 +313,12 @@ export class RequestTransformer {
   private maxToolOutputLength: number;
   private keepRecentMessages: number;
   private modelProvider: 'anthropic' | 'azure' | 'google';
+  private extractFileAttachments: boolean;
+  private minFileAttachmentSize: number;
+
+  // Accumulated file attachments during transform
+  private fileAttachments: FileAttachment[] = [];
+  private fileIdCounter = 0;
 
   constructor(config: TransformerConfig = {}) {
     this.hardLimit = config.hardLimit ?? DEFAULT_HARD_LIMIT;
@@ -258,6 +326,8 @@ export class RequestTransformer {
     this.maxToolOutputLength = config.maxToolOutputLength ?? DEFAULT_MAX_TOOL_OUTPUT_LENGTH;
     this.keepRecentMessages = config.keepRecentMessages ?? DEFAULT_KEEP_RECENT_MESSAGES;
     this.modelProvider = config.modelProvider ?? 'anthropic';
+    this.extractFileAttachments = config.extractFileAttachments ?? true;
+    this.minFileAttachmentSize = config.minFileAttachmentSize ?? 2000;
   }
 
   /**
@@ -270,6 +340,8 @@ export class RequestTransformer {
       maxToolOutputLength: this.maxToolOutputLength,
       keepRecentMessages: this.keepRecentMessages,
       modelProvider: this.modelProvider,
+      extractFileAttachments: this.extractFileAttachments,
+      minFileAttachmentSize: this.minFileAttachmentSize,
     };
   }
 
@@ -282,115 +354,254 @@ export class RequestTransformer {
     if (config.maxToolOutputLength !== undefined) this.maxToolOutputLength = config.maxToolOutputLength;
     if (config.keepRecentMessages !== undefined) this.keepRecentMessages = config.keepRecentMessages;
     if (config.modelProvider !== undefined) this.modelProvider = config.modelProvider;
+    if (config.extractFileAttachments !== undefined) this.extractFileAttachments = config.extractFileAttachments;
+    if (config.minFileAttachmentSize !== undefined) this.minFileAttachmentSize = config.minFileAttachmentSize;
   }
 
   /**
-   * Combine message history into a single prompt.
+   * Combine message history into a single prompt using budget-based assembly.
    * POSTECH API expects a single text query, so we combine all messages.
+   *
+   * Budget priority:
+   * 1. Header (MCP_TOOL_PROMPT) - MUST be preserved
+   * 2. Current user message - MUST be preserved
+   * 3. History - fills remaining budget (most recent first)
+   *
+   * @returns TransformerResult with message and file attachments
    */
-  transform(messages: Message[]): string {
-    const userWrapperPrefix = generateUserWrapperPrefix(this.hardLimit);
-    const parts: string[] = [];
+  transform(messages: Message[]): TransformerResult {
+    // Reset file attachments for this transform
+    this.fileAttachments = [];
+    this.fileIdCounter = 0;
 
-    // // Only add response length constraint for Claude (anthropic) due to 5KB API limit
-    // if (this.modelProvider === 'anthropic') {
-    //   const responseConstraint = generateResponseConstraint(this.hardLimit);
-    //   parts.push(responseConstraint);
-    // }
+    // 1. Build header (MUST be preserved - contains tool instructions)
+    const header = this.buildHeader();
+    const headerBudget = header.length;
+
+    // 2. Build current user message (MUST be preserved)
+    const currentUserMsg = this.getCurrentUserMessage(messages);
+    const currentMsgBudget = currentUserMsg.length;
+
+    // 3. Calculate remaining budget for history
+    // Reserve 500 chars for safety margin and separators
+    const historyBudget = Math.max(0, this.maxTextLength - headerBudget - currentMsgBudget - 500);
+
+    // 4. Build history within budget (most recent first)
+    const history = this.buildHistoryWithBudget(messages, historyBudget);
+
+    // 5. Assemble: header + history + currentUserMsg
+    const parts = [header, history, currentUserMsg].filter(Boolean);
+    const message = this.sanitizeText(parts.join('\n\n'));
+
+    return {
+      message,
+      files: this.fileAttachments,
+    };
+  }
+
+  /**
+   * Legacy transform method for backward compatibility.
+   * Returns only the message string.
+   * @deprecated Use transform() which returns TransformerResult
+   */
+  transformMessage(messages: Message[]): string {
+    return this.transform(messages).message;
+  }
+
+  /**
+   * Build the header section (tool instructions).
+   * This section MUST always be preserved.
+   */
+  private buildHeader(): string {
+    const parts: string[] = [];
 
     // Add GPT-specific tool reminder (GPT tends to think it can't use tools)
     if (this.modelProvider === 'azure' || this.modelProvider === 'google') {
       parts.push(GPT_TOOL_REMINDER);
     }
 
+    // Always include MCP tool prompt - this is critical for tool usage
     parts.push(MCP_TOOL_PROMPT);
 
-    if (messages.length === 1) {
-      const content = this.extractTextContent(messages[0].content);
-      parts.push(`${userWrapperPrefix}\n[User]: ${content}\n${USER_WRAPPER_SUFFIX}`);
-      return this.truncateIfNeeded(this.sanitizeText(parts.join('\n\n')));
-    }
+    return parts.join('\n\n');
+  }
 
-    // Find the last user message index
+  /**
+   * Extract and format the current (last) user message.
+   */
+  private getCurrentUserMessage(messages: Message[]): string {
+    // Find last user message
     let lastUserIdx = -1;
-    for (let i = 0; i < messages.length; i++) {
+    for (let i = messages.length - 1; i >= 0; i--) {
       if (messages[i].role === 'user') {
         lastUserIdx = i;
+        break;
       }
     }
 
-    // Determine which messages to keep fully (recent ones)
-    const totalMsgs = messages.length;
-    const keepFromIdx = Math.max(0, totalMsgs - this.keepRecentMessages);
+    if (lastUserIdx === -1) return '';
 
+    const content = this.extractTextContent(messages[lastUserIdx].content);
+    if (!content || content.startsWith('[SYSTEM]')) return '';
+
+    const userWrapperPrefix = generateUserWrapperPrefix(this.hardLimit);
+    return `${userWrapperPrefix}\n[User]: ${content}\n${USER_WRAPPER_SUFFIX}`;
+  }
+
+  /**
+   * Build conversation history within a character budget.
+   * Processes messages from most recent to oldest, stopping when budget is exhausted.
+   */
+  private buildHistoryWithBudget(messages: Message[], budget: number): string {
+    if (budget <= 0 || messages.length <= 1) return '';
+
+    const parts: string[] = [];
+    let used = 0;
     let skippedCount = 0;
 
-    for (let i = 0; i < messages.length; i++) {
+    // Find last user message index (we'll skip this since it's handled separately)
+    let lastUserIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') {
+        lastUserIdx = i;
+        break;
+      }
+    }
+
+    // Process messages from most recent to oldest (excluding last user message)
+    for (let i = messages.length - 1; i >= 0; i--) {
+      // Skip the last user message (handled by getCurrentUserMessage)
+      if (i === lastUserIdx) continue;
+
       const msg = messages[i];
-      const content = this.extractTextContent(msg.content);
-      if (!content) continue;
+      const formatted = this.formatMessage(msg, false);
+      if (!formatted) continue;
 
-      // Skip CLI system messages (not relevant to AI)
-      if (content.startsWith('[SYSTEM]')) {
-        continue;
-      }
-
-      // System messages always kept
-      if (msg.role === 'system') {
-        parts.push(`[System Instructions]: ${content.slice(0, 2000)}`);
-        continue;
-      }
-
-      // Skip old messages (except system)
-      if (i < keepFromIdx) {
+      // Check if we have budget for this message
+      if (used + formatted.length > budget) {
         skippedCount++;
         continue;
       }
 
-      // Add skipped message indicator once
-      if (skippedCount > 0 && i === keepFromIdx) {
-        parts.push(`[...${skippedCount} previous messages omitted...]`);
-        skippedCount = 0;
-      }
+      // Add to front (we're iterating backwards)
+      parts.unshift(formatted);
+      used += formatted.length;
+    }
 
-      // Truncate tool outputs heavily
-      if (msg.role === 'tool') {
-        let truncated = content.slice(0, this.maxToolOutputLength);
-        if (content.length > this.maxToolOutputLength) {
-          // Check if this is a file.read result (has SHA256)
-          const isFileRead = content.includes('SHA256:');
-          if (isFileRead) {
-            truncated += `\n\n[!] Full file content stored in system. Do NOT re-read! Use SHA256 with file.applyTextEdits.`;
-          } else {
-            truncated += `... (showing partial of ${content.length} chars)`;
-          }
+    // Add skipped indicator if we couldn't fit all messages
+    if (skippedCount > 0) {
+      parts.unshift(`[...${skippedCount} older messages omitted due to context limit...]`);
+    }
+
+    return parts.join('\n\n');
+  }
+
+  /**
+   * Format a single message for inclusion in the prompt.
+   */
+  private formatMessage(msg: Message, isLastUserMsg: boolean): string {
+    const content = this.extractTextContent(msg.content);
+    if (!content) return '';
+
+    // Skip CLI system messages (not relevant to AI)
+    if (content.startsWith('[SYSTEM]')) {
+      return '';
+    }
+
+    switch (msg.role) {
+      case 'system':
+        return `[System Instructions]: ${content.slice(0, 2000)}`;
+
+      case 'tool':
+        return this.formatToolResult(content);
+
+      case 'user':
+        if (isLastUserMsg) {
+          const userWrapperPrefix = generateUserWrapperPrefix(this.hardLimit);
+          return `${userWrapperPrefix}\n[User]: ${content}\n${USER_WRAPPER_SUFFIX}`;
         }
-        parts.push(`[Tool Result]: ${truncated}`);
-      } else if (msg.role === 'user') {
-        if (i === lastUserIdx) {
-          parts.push(`${userWrapperPrefix}\n[User]: ${content}\n${USER_WRAPPER_SUFFIX}`);
-        } else {
-          parts.push(`[User]: ${content.slice(0, 1000)}`);
-        }
-      } else if (msg.role === 'assistant') {
-        // Truncate old assistant responses
+        return `[User]: ${content.slice(0, 1000)}`;
+
+      case 'assistant':
         let truncated = content.slice(0, 1500);
         if (content.length > 1500) {
           truncated += '...';
         }
-        parts.push(`[Assistant]: ${truncated}`);
-      } else {
-        parts.push(`[${msg.role}]: ${content.slice(0, 500)}`);
-      }
+        return `[Assistant]: ${truncated}`;
+
+      default:
+        return `[${msg.role}]: ${content.slice(0, 500)}`;
+    }
+  }
+
+  /**
+   * Format tool result with SHA256 preservation for file.read results.
+   * Large file.read results are extracted as file attachments if enabled.
+   */
+  private formatToolResult(content: string): string {
+    // Check if this is a file.read result (has SHA256 and file path pattern)
+    const isFileRead = content.includes('SHA256:');
+    const filePathMatch = content.match(/File:\s*(.+?)(?:\s*\(|$|\n)/);
+    const sha256Match = content.match(/SHA256:\s*([a-f0-9]+)/i);
+
+    // Extract file.read results as attachments if:
+    // 1. File attachment extraction is enabled
+    // 2. Content is large enough to warrant extraction
+    // 3. This is a file.read result with identifiable filepath
+    if (
+      this.extractFileAttachments &&
+      isFileRead &&
+      filePathMatch &&
+      content.length >= this.minFileAttachmentSize
+    ) {
+      const filepath = filePathMatch[1].trim();
+      const filename = filepath.split('/').pop() ?? 'file.txt';
+      const sha256 = sha256Match ? sha256Match[1] : '';
+
+      // Extract the actual file content (after the header lines)
+      const contentStartMatch = content.match(/---+\n([\s\S]*)/);
+      const fileContent = contentStartMatch ? contentStartMatch[1] : content;
+
+      // Create file attachment
+      const fileId = `file_${++this.fileIdCounter}`;
+      const attachment: FileAttachment = {
+        id: fileId,
+        name: filename,
+        url: contentToDataUrl(fileContent, filename),
+      };
+      this.fileAttachments.push(attachment);
+
+      // Return a reference to the attached file (keeps SHA256 for file.applyTextEdits)
+      return `[Tool Result - file.read]: ${filepath}
+SHA256: ${sha256}
+[File attached as: ${filename} (id: ${fileId})]
+Total lines: ${fileContent.split('\n').length}
+
+[!] Full content is in the attached file. Use the SHA256 above for file.applyTextEdits.`;
     }
 
-    const combined = this.sanitizeText(parts.join('\n\n'));
-    return this.truncateIfNeeded(combined);
+    // Small content - include directly
+    if (content.length <= this.maxToolOutputLength) {
+      return `[Tool Result]: ${content}`;
+    }
+
+    // Large content but not extractable as file - truncate with SHA256 preserved
+    if (isFileRead && sha256Match) {
+      const sha256Line = `SHA256: ${sha256Match[1]}`;
+      const remainingBudget = this.maxToolOutputLength - sha256Line.length - 100;
+      const preview = content.slice(0, Math.max(0, remainingBudget));
+
+      return `[Tool Result]: ${sha256Line}\n\n${preview}...\n\n[!] Content truncated (${content.length} chars). Use file.read with startLine/endLine for specific sections.`;
+    }
+
+    // Regular tool output - just truncate
+    const truncated = content.slice(0, this.maxToolOutputLength);
+    return `[Tool Result]: ${truncated}... (${content.length} chars total)`;
   }
 
   /**
    * Sanitize text for API.
-   * A2 API has issues with backticks in JSON payload.
+   * Removes control characters but preserves backticks for tool format.
    */
   private sanitizeText(text: string): string {
     // Normalize line endings
@@ -399,30 +610,10 @@ export class RequestTransformer {
     // Remove control characters except newline and tab
     result = result.replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
 
-    // Escape backticks to avoid JSON parsing errors in A2 API
-    // Using backslash escape: ` -> \`
-    result = result.replace(/`/g, '\\`');
+    // NOTE: We use [CODE]tool format instead of backticks to avoid JSON parsing issues with A2 API
+    // The ToolParser supports both formats: [CODE]tool and ```tool
 
     return result;
-  }
-
-  /**
-   * Truncate text from beginning if too long, keeping recent context.
-   */
-  private truncateIfNeeded(text: string): string {
-    if (text.length <= this.maxTextLength) {
-      return text;
-    }
-
-    let truncated = text.slice(-this.maxTextLength);
-
-    // Find first newline to avoid cutting mid-sentence
-    const firstNewline = truncated.indexOf('\n');
-    if (firstNewline > 0 && firstNewline < 500) {
-      truncated = truncated.slice(firstNewline + 1);
-    }
-
-    return `[Previous conversation truncated...]\n\n${truncated}`;
   }
 
   /**

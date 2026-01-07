@@ -21,6 +21,15 @@ import { fileSearchTool, executeFileSearch, type FileSearchArgs } from './tools/
 import { fileApplyEditsTool, executeFileApplyEdits, type FileApplyEditsArgs } from './tools/file-apply-edits.js';
 import { fuzzyFindFiles, formatFuzzyResults } from './core/fuzzy-finder.js';
 
+// Import git tools
+import {
+  gitStatusTool, executeGitStatus, type GitStatusArgs,
+  gitDiffTool, executeGitDiff, type GitDiffArgs,
+  gitLogTool, executeGitLog, type GitLogArgs,
+  gitRestoreTool, executeGitRestore, type GitRestoreArgs,
+  gitShowTool, executeGitShow, type GitShowArgs,
+} from './tools/git-tools.js';
+
 const execAsync = promisify(exec);
 
 // Workspace directory - can be set via:
@@ -188,6 +197,12 @@ Tips: Use key characters from filename, no need for exact glob patterns.`,
       fileReadTool,
       fileSearchTool,
       fileApplyEditsTool,
+      // Git tools - for tracking changes
+      gitStatusTool,
+      gitDiffTool,
+      gitLogTool,
+      gitRestoreTool,
+      gitShowTool,
     ],
   };
 });
@@ -391,6 +406,22 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case 'file.applyTextEdits':
         return await executeFileApplyEdits(resolvePath, args as unknown as FileApplyEditsArgs);
+
+      // Git tools
+      case 'git.status':
+        return await executeGitStatus(WORKSPACE_DIR, args as unknown as GitStatusArgs);
+
+      case 'git.diff':
+        return await executeGitDiff(WORKSPACE_DIR, args as unknown as GitDiffArgs);
+
+      case 'git.log':
+        return await executeGitLog(WORKSPACE_DIR, args as unknown as GitLogArgs);
+
+      case 'git.restore':
+        return await executeGitRestore(WORKSPACE_DIR, args as unknown as GitRestoreArgs);
+
+      case 'git.show':
+        return await executeGitShow(WORKSPACE_DIR, args as unknown as GitShowArgs);
 
       default:
         throw new Error(`Unknown tool: ${name}`);

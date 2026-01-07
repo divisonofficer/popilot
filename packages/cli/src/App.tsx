@@ -458,15 +458,16 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         logger.logConversation(iteration, conversationMessages);
 
         // Transform messages to POSTECH API format (includes system prompt with tools)
-        const text = transformer.transform(conversationMessages);
+        const transformResult = transformer.transform(conversationMessages);
+        const { message: text, files: fileAttachments } = transformResult;
 
         // Stream response - just accumulate, don't parse during streaming
         setState('streaming');
         let rawResponse = '';
 
         if (authMode === 'apikey') {
-          // A2 API - simpler payload
-          for await (const chunk of client.streamQueryA2(credential, text, a2Model, false)) {
+          // A2 API - simpler payload with file attachments
+          for await (const chunk of client.streamQueryA2(credential, text, a2Model, false, fileAttachments)) {
             if (chunk.type === 'text' && chunk.content) {
               rawResponse = chunk.content; // A2 returns full response, not incremental
               const displayText = filterOutput(rawResponse);
@@ -474,9 +475,9 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             }
           }
         } else {
-          // SSO API - full payload with chat room
+          // SSO API - full payload with chat room (file attachments not supported in SSO mode)
           const payload = PostechClient.buildPayload(
-            text,
+            text,  // transformResult.message
             initResult!.userInfo,
             modelConfig,
             sessionService.getCurrentSession(currentModel).threadId
@@ -963,7 +964,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       }
 
       default:
-        setError(`알 수 없는 명령어: /${cmd}.\n\n[Popilot CLI 도움말]\n\n- /help : 모든 명령어와 사용법 안내를 출력합니다.\n- /exit : 프로그램을 종료합니다.\n- /clear : 대화 내용을 초기화합니다.\n- /model <모델명> : 사용할 AI 모델을 변경합니다.\n- /config : 현재 설정을 확인합니다.\n\n명령어는 슬래시(/)로 시작하며, 자세한 사용법은 공식 문서를 참고하세요!\n\n예시) /model gpt-4o\n\n더 궁금한 점이 있으면 언제든 /help를 입력하세요. 😊`);
+        setError(`알 수 없는 명령어: /${cmd}.\n\n[Popilot CLI 도움말]\n\n- /help : 모든 명령어와 사용법 안내를 출력합니다.\n    예시) /help\n    → 모든 명령어와 상세 설명을 확인할 수 있습니다.\n- /exit : 프로그램을 종료합니다.\n    예시) /exit\n    → Popilot CLI를 종료합니다.\n- /clear : 대화 내용을 초기화합니다.\n    예시) /clear\n    → 이전 대화 기록이 모두 삭제됩니다.\n- /model <모델명> : 사용할 AI 모델을 변경합니다.\n    예시) /model gpt-4o\n    → 현재 대화에 사용할 AI 모델을 gpt-4o로 변경합니다.\n- /config : 현재 설정을 확인합니다.\n    예시) /config\n    → 현재 적용된 모델, 환경설정 등 정보를 확인할 수 있습니다.\n\n명령어는 반드시 슬래시(/)로 시작해야 하며, 각 명령어에 대한 자세한 사용법은 공식 문서를 참고하세요!\n\n예시) /model gpt-4o\n\n더 궁금한 점이 있으면 언제든 /help를 입력하세요. 😊`);
     }
   }, [exit, messages, autoConfirm, authMode]);
 
@@ -1195,15 +1196,16 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         logger.logConversation(iteration, conversationMessages);
 
         // Transform messages to POSTECH API format
-        const text = transformer.transform(conversationMessages);
+        const transformResult = transformer.transform(conversationMessages);
+        const { message: text, files: fileAttachments } = transformResult;
 
         // Stream response
         setState('streaming');
         let rawResponse = '';
 
         if (loopAuthMode === 'apikey') {
-          // A2 API
-          for await (const chunk of client.streamQueryA2(credential, text, loopA2Model, false)) {
+          // A2 API with file attachments
+          for await (const chunk of client.streamQueryA2(credential, text, loopA2Model, false, fileAttachments)) {
             if (chunk.type === 'text' && chunk.content) {
               rawResponse = chunk.content;
               const displayText = filterOutput(rawResponse);
@@ -1211,9 +1213,9 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             }
           }
         } else {
-          // SSO API
+          // SSO API (file attachments not supported)
           const payload = PostechClient.buildPayload(
-            text,
+            text,  // transformResult.message
             initResult!.userInfo,
             modelConfig,
             sessionService.getCurrentSession(currentModel).threadId
