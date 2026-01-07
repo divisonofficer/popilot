@@ -14,6 +14,7 @@ export {
   type ChatRoomInfo,
   type AuthMode,
   type UserApiKey,
+  type ChatThread,
 } from './client/postech-client.js';
 export { RequestTransformer, type TransformerConfig, type TransformerResult } from './client/request-transformer.js';
 export {

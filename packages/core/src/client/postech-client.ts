@@ -103,6 +103,20 @@ export interface UserApiKey {
 }
 
 /**
+ * Chat thread info from threads list API.
+ */
+export interface ChatThread {
+  chatThreadsId: number;
+  chatRoomsId: number;
+  authUsersId: number;
+  chatThreadsName: string;
+  createdAt: string;
+  updatedAt: string;
+  lastChatLogUpdatedAt: string;
+  chatLogCount: number;
+}
+
+/**
  * Async HTTP client for POSTECH GenAI API with SSE streaming support.
  */
 export class PostechClient {
@@ -363,6 +377,72 @@ export class PostechClient {
     }
 
     throw new PostechClientError('Invalid response from createChatRoom');
+  }
+
+  /**
+   * Get list of chat threads for a chat room.
+   * Returns threads sorted by lastChatLogUpdatedAt DESC (most recent first).
+   */
+  async getThreadsList(
+    token: string,
+    chatRoomsId?: number,
+    page: number = 1,
+    size: number = 20
+  ): Promise<ChatThread[]> {
+    let url = `${this.baseUrl}/v2/datahub/chats/threads/list?page=${page}&size=${size}&sort=lastChatLogUpdatedAt:DESC`;
+    if (chatRoomsId) {
+      url += `&filter=chatRoomsId:${chatRoomsId}`;
+    }
+
+    console.log(`\n=== Get Threads List ===`);
+    console.log(`URL: ${url}`);
+
+    const response = await fetch(url, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        Accept: 'application/json, text/plain, */*',
+        Origin: this.baseUrl,
+        Referer: `${this.baseUrl}/home`,
+        'Cache-Control': 'no-store',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36',
+      },
+    });
+
+    if (!response.ok) {
+      throw new PostechClientError(
+        `Failed to get threads list: ${response.status} ${response.statusText}`,
+        response.status
+      );
+    }
+
+    interface ThreadsListResponse {
+      code?: string;
+      message?: string;
+      data?: {
+        indexUid?: string;
+        documents?: ChatThread[];
+      };
+    }
+    const data = (await response.json()) as ThreadsListResponse;
+    console.log(`Response: Found ${data.data?.documents?.length ?? 0} threads`);
+
+    return data.data?.documents ?? [];
+  }
+
+  /**
+   * Get the most recent thread ID for a chat room.
+   * Useful for continuing conversations in A2 API.
+   */
+  async getLatestThreadId(token: string, chatRoomsId?: number): Promise<number | null> {
+    const threads = await this.getThreadsList(token, chatRoomsId, 1, 1);
+    if (threads.length > 0) {
+      console.log(`Latest thread: ${threads[0].chatThreadsId} (${threads[0].chatThreadsName})`);
+      return threads[0].chatThreadsId;
+    }
+    return null;
   }
 
   /**
@@ -718,13 +798,18 @@ export class PostechClient {
    * @param model - Model name ('gemini', 'gpt', 'claude')
    * @param stream - Whether to stream response (default: false)
    * @param files - Optional file attachments with { id, name, url } (url is required by A2 API)
+   * @param options - Optional thread/room IDs for conversation continuity
    */
   async *streamQueryA2(
     apiKey: string,
     message: string,
     model: 'gemini' | 'gpt' | 'claude' = 'gemini',
     stream: boolean = true,
-    files: Array<{ id: string; name: string; url: string }> = []
+    files: Array<{ id: string; name: string; url: string }> = [],
+    options?: {
+      chatThreadsId?: number;
+      chatRoomsId?: number;
+    }
   ): AsyncGenerator<StreamChunk> {
     // GPT: a1, Gemini: a2, Claude: a3
     const apiVersion = model === 'gpt' ? 1 : model === 'gemini' ? 2 : 3;
@@ -732,11 +817,21 @@ export class PostechClient {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), this.timeoutMs);
 
-    const payload = {
+    // Build payload with optional thread/room IDs
+    const payload: Record<string, unknown> = {
       message,
       stream,
       files,
     };
+
+    // Add thread/room IDs if provided (for conversation continuity)
+    if (options?.chatThreadsId) {
+      payload.chat_threads_id = options.chatThreadsId;
+    }
+    if (options?.chatRoomsId) {
+      payload.chat_room_id = options.chatRoomsId;
+    }
+
     const bodyStr = JSON.stringify(payload);
 
     console.log('\n=== A2 API Request ===');
@@ -745,6 +840,12 @@ export class PostechClient {
     console.log(`Message: ${message.slice(0, 100)}...`);
     if (files.length > 0) {
       console.log(`Files attached: ${files.length} (${files.map(f => f.name).join(', ')})`);
+    }
+    if (options?.chatThreadsId) {
+      console.log(`Thread ID: ${options.chatThreadsId}`);
+    }
+    if (options?.chatRoomsId) {
+      console.log(`Room ID: ${options.chatRoomsId}`);
     }
     console.log('======================\n');
 

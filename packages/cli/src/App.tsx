@@ -2,6 +2,7 @@
  * Main App Component for Popilot CLI
  */
 
+import * as path from 'node:path';
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { Box, Text, useApp, useInput, useStdin } from 'ink';
 import {
@@ -381,6 +382,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
   }, [autoConfirmSettings]);
   const [authMode, setAuthMode] = useState<AuthMode>('apikey');
   const [ssoToken, setSsoToken] = useState<string | null>(null);  // SSO token for file uploads
+  const ssoTokenRef = useRef<string | null>(null);  // Sync ref for SSO token (React state is async)
   const [ssoStatus, setSsoStatus] = useState<'idle' | 'authenticating' | 'success' | 'failed'>('idle');
   const [isInitializing, setIsInitializing] = useState(true);  // Auto-auth on startup
   // Use ref for file attachments - useState is async and won't update in same iteration
@@ -442,7 +444,10 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       apiUrl: DEFAULT_CONFIG.apiUrl,
     });
 
-    const sessionService = new SessionService();
+    // Use project-local .popilot directory for sessions and logs
+    const sessionService = new SessionService({
+      sessionsDir: path.join(workingDir, '.popilot', 'sessions'),
+    });
     const toolExecutor = new ToolExecutor({ workspaceDir: workingDir });
 
     // Initialize transformer with model-specific settings
@@ -522,7 +527,8 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
   }, []);
 
   /**
-   * Auto-authenticate on startup if no API key is available.
+   * Auto-authenticate on startup.
+   * Always attempt SSO to get token (needed for thread ID and file uploads).
    */
   useEffect(() => {
     if (!servicesRef.current) return;
@@ -530,44 +536,53 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     const autoAuthenticate = async () => {
       const { apiKeyAuthenticator, tokenManager } = servicesRef.current!;
 
-      // Check if API key already exists
-      if (apiKeyAuthenticator.hasApiKey()) {
+      const hasApiKey = apiKeyAuthenticator.hasApiKey();
+
+      if (hasApiKey) {
         console.log('Using stored API key');
-        setIsInitializing(false);
-        return;
+      } else {
+        console.log('No API key found. Starting SSO authentication...');
+        setMessages((prev) => [...prev, {
+          role: 'assistant',
+          content: '[SYSTEM] API 키가 없습니다. SSO 로그인을 시작합니다...',
+        }]);
       }
 
-      // No API key - try SSO login and fetch API key
-      console.log('No API key found. Starting SSO authentication...');
-      setMessages((prev) => [...prev, {
-        role: 'assistant',
-        content: '[SYSTEM] API 키가 없습니다. SSO 로그인을 시작합니다...',
-      }]);
-
+      // Always try SSO to get token (needed for thread ID and file uploads)
       try {
         const token = await tokenManager.getValidToken();
         setSsoToken(token);
+        ssoTokenRef.current = token;  // Sync update for immediate use
         setIsAuthenticated(true);
+        console.log('SSO token acquired');
 
-        // Fetch and save API key from server
-        const apiKey = await fetchAndSaveApiKey(token);
-        if (apiKey) {
-          setMessages((prev) => [...prev, {
-            role: 'assistant',
-            content: '[SYSTEM] API 키를 서버에서 가져와 저장했습니다.',
-          }]);
-        } else {
-          setMessages((prev) => [...prev, {
-            role: 'assistant',
-            content: '[SYSTEM] 서버에 API 키가 없습니다. https://genai.postech.ac.kr 에서 API 키를 발급받으세요.',
-          }]);
+        // If no API key, fetch from server
+        if (!hasApiKey) {
+          const apiKey = await fetchAndSaveApiKey(token);
+          if (apiKey) {
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: '[SYSTEM] API 키를 서버에서 가져와 저장했습니다.',
+            }]);
+          } else {
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: '[SYSTEM] 서버에 API 키가 없습니다. https://genai.postech.ac.kr 에서 API 키를 발급받으세요.',
+            }]);
+          }
         }
       } catch (error) {
-        console.error('Auto-authentication failed:', error);
-        setMessages((prev) => [...prev, {
-          role: 'assistant',
-          content: `[SYSTEM] 자동 인증 실패: ${error instanceof Error ? error.message : String(error)}`,
-        }]);
+        console.error('SSO authentication failed:', error);
+        if (!hasApiKey) {
+          // Only show error if we needed SSO for API key
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: `[SYSTEM] 자동 인증 실패: ${error instanceof Error ? error.message : String(error)}`,
+          }]);
+        } else {
+          // API key exists but SSO failed - just log, don't block
+          console.log('SSO failed but API key available - continuing without SSO token');
+        }
       } finally {
         setIsInitializing(false);
       }
@@ -768,6 +783,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             try {
               uploadToken = await tokenManager.getValidToken();
               setSsoToken(uploadToken);
+              ssoTokenRef.current = uploadToken;  // Sync update
             } catch {
               // No SSO token available - warn and skip file uploads
               console.log('⚠️ SSO 토큰 없음 - 파일 첨부 건너뜀');
@@ -801,15 +817,47 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
         let rawResponse = '';
 
         if (authMode === 'apikey') {
-          // Log A2 API request
-          logger.logA2Request(iteration, text, a2Model, uploadedFiles);
+          // Get thread ID from session for conversation continuity (if available)
+          const currentThreadId = sessionService.getCurrentSession(currentModel).threadId;
+          const a2Options = currentThreadId ? { chatThreadsId: currentThreadId } : undefined;
+
+          // Log A2 API request with thread ID
+          logger.logA2Request(iteration, text, a2Model, uploadedFiles, currentThreadId);
+
+          // Log thread ID usage
+          if (currentThreadId) {
+            logger.logThreadId(iteration, 'use', currentThreadId, 'Sending with A2 request');
+          } else {
+            logger.logThreadId(iteration, 'use', null, 'No thread ID - first request');
+          }
 
           // A2 API - simpler payload with uploaded file IDs
-          for await (const chunk of client.streamQueryA2(credential, text, a2Model, false, uploadedFiles)) {
+          for await (const chunk of client.streamQueryA2(credential, text, a2Model, false, uploadedFiles, a2Options)) {
             if (chunk.type === 'text' && chunk.content) {
               rawResponse = chunk.content; // A2 returns full response, not incremental
               const displayText = filterOutput(rawResponse);
               throttledSetCurrentResponse(fullDisplayResponse + displayText);
+            }
+          }
+
+          // After first A2 response, fetch thread ID for conversation continuity
+          if (!currentThreadId) {
+            if (!ssoTokenRef.current) {
+              logger.logThreadId(iteration, 'fetch', null, 'Skipped - no SSO token available (API key only mode)');
+            } else {
+              logger.logThreadId(iteration, 'fetch', null, 'Attempting to fetch latest thread ID');
+              try {
+                const latestThreadId = await client.getLatestThreadId(ssoTokenRef.current!);
+                if (latestThreadId) {
+                  sessionService.setThreadId(latestThreadId);
+                  logger.logThreadId(iteration, 'save', latestThreadId, 'Saved to session');
+                } else {
+                  logger.logThreadId(iteration, 'fetch', null, 'No thread ID returned from server');
+                }
+              } catch (threadError) {
+                logger.logThreadId(iteration, 'fetch', null, `Error: ${threadError instanceof Error ? threadError.message : String(threadError)}`);
+                // Non-critical error - continue without thread ID
+              }
             }
           }
         } else {
@@ -1167,9 +1215,85 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       case 'help':
         setMessages((prev) => [...prev, {
           role: 'assistant',
-          content: `[SYSTEM] 명령어: /model, /clear, /thread, /retry, /config, /autoconfirm, /session, /api, /api-refresh, /sso, /auth, /logout, /quit`,
+          content: `[SYSTEM] 명령어: /model, /clear, /thread, /retry, /config, /autoconfirm, /session, /api, /api-refresh, /sso, /auth, /log, /logout, /quit`,
         }]);
         break;
+
+      case 'log': {
+        // /log - show log stats
+        // /log archive - archive logs to subfolder
+        // /log delete - delete all logs
+        // /log archives - list archived folders
+        const { logger } = servicesRef.current!;
+        const subCmd = args[0]?.toLowerCase();
+
+        if (!subCmd) {
+          // Show log stats
+          const stats = logger.getLogStats();
+          const sizeKB = (stats.totalSize / 1024).toFixed(1);
+          const archives = logger.listArchives();
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: `[SYSTEM] 로그 현황:
+- 파일 수: ${stats.fileCount}개
+- 총 크기: ${sizeKB} KB
+- 경로: ${logger.getLogDir()}
+- 아카이브: ${archives.length}개
+
+명령어:
+- /log archive - 현재 로그를 아카이브 폴더로 이동
+- /log delete - 현재 로그 삭제
+- /log archives - 아카이브 목록 보기`,
+          }]);
+        } else if (subCmd === 'archive') {
+          const result = logger.archiveLogs();
+          if (result.success) {
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] ${result.fileCount}개 로그 파일을 아카이브했습니다.
+→ ${result.archiveDir}`,
+            }]);
+          } else {
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] 아카이브 실패: ${result.error}`,
+            }]);
+          }
+        } else if (subCmd === 'delete' || subCmd === 'clear') {
+          const result = logger.deleteLogs();
+          if (result.success) {
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] ${result.fileCount}개 로그 파일을 삭제했습니다.`,
+            }]);
+          } else {
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] 삭제 실패: ${result.error}`,
+            }]);
+          }
+        } else if (subCmd === 'archives' || subCmd === 'list') {
+          const archives = logger.listArchives();
+          if (archives.length === 0) {
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] 아카이브 없음`,
+            }]);
+          } else {
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] 아카이브 목록 (${archives.length}개):
+${archives.map(a => `- ${a}`).join('\n')}`,
+            }]);
+          }
+        } else {
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: `[SYSTEM] 사용법: /log, /log archive, /log delete, /log archives`,
+          }]);
+        }
+        break;
+      }
 
       case 'autoconfirm':
       case 'auto': {
@@ -1380,6 +1504,7 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
             }
 
             setSsoToken(token);
+            ssoTokenRef.current = token;  // Sync update
             const apiKey = await fetchAndSaveApiKey(token);
             if (apiKey) {
               setMessages((prev) => [...prev, {
@@ -1709,6 +1834,7 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
             try {
               uploadToken = await tokenManager.getValidToken();
               setSsoToken(uploadToken);
+              ssoTokenRef.current = uploadToken;  // Sync update
             } catch {
               // No SSO token available - skip file uploads
               console.log('⚠️ SSO 토큰 없음 - 파일 첨부 건너뜀');
@@ -1738,15 +1864,44 @@ setError(`\n[Popilot CLI 도움말]\n\nPopilot CLI에서는 다양한 슬래시(
         let rawResponse = '';
 
         if (loopAuthMode === 'apikey') {
-          // Log A2 API request
-          logger.logA2Request(iteration, text, loopA2Model, uploadedFiles);
+          // Get thread ID from session for conversation continuity
+          const currentThreadId = sessionService.getCurrentSession(currentModel).threadId;
+          const a2Options = currentThreadId ? { chatThreadsId: currentThreadId } : undefined;
+
+          // Log A2 API request with thread ID
+          logger.logA2Request(iteration, text, loopA2Model, uploadedFiles, currentThreadId);
+
+          // Log thread ID usage
+          if (currentThreadId) {
+            logger.logThreadId(iteration, 'use', currentThreadId, 'Sending with A2 request (resumed loop)');
+          } else {
+            logger.logThreadId(iteration, 'use', null, 'No thread ID - resumed loop');
+          }
 
           // A2 API with uploaded file IDs
-          for await (const chunk of client.streamQueryA2(credential, text, loopA2Model, false, uploadedFiles)) {
+          for await (const chunk of client.streamQueryA2(credential, text, loopA2Model, false, uploadedFiles, a2Options)) {
             if (chunk.type === 'text' && chunk.content) {
               rawResponse = chunk.content;
               const displayText = filterOutput(rawResponse);
               throttledSetCurrentResponse(fullDisplayResponse + displayText);
+            }
+          }
+
+          // After first A2 response, fetch thread ID for conversation continuity
+          if (!currentThreadId) {
+            if (!ssoTokenRef.current) {
+              logger.logThreadId(iteration, 'fetch', null, 'Skipped - no SSO token (resumed loop)');
+            } else {
+              logger.logThreadId(iteration, 'fetch', null, 'Attempting to fetch (resumed loop)');
+              try {
+                const latestThreadId = await client.getLatestThreadId(ssoTokenRef.current!);
+                if (latestThreadId) {
+                  sessionService.setThreadId(latestThreadId);
+                  logger.logThreadId(iteration, 'save', latestThreadId, 'Saved (resumed loop)');
+                }
+              } catch {
+                // Non-critical error - continue without thread ID
+              }
             }
           }
         } else {
