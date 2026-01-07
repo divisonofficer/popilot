@@ -19,6 +19,8 @@ import {
   ToolParser,
   DebugLogger,
   FileUploader,
+  CheckpointService,
+  PolicyEngine,
   AVAILABLE_MODELS,
   MODEL_ALIASES,
   resolveModelName,
@@ -30,6 +32,7 @@ import {
   type FileAttachment,
   type UploadedFile,
   type UserApiKey,
+  type ApprovalMode,
 } from '@popilot/core';
 import { Header } from './ui/Header.js';
 import { ChatView } from './ui/ChatView.js';
@@ -422,6 +425,8 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     transformer: RequestTransformer;
     logger: DebugLogger;
     fileUploader: FileUploader;
+    checkpointService: CheckpointService;
+    policyEngine: PolicyEngine;
   } | null>(null);
 
   // Ref for pending loop state during tool confirmation
@@ -482,6 +487,13 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
     const logger = new DebugLogger(workingDir, true);
     const fileUploader = new FileUploader();
 
+    // Checkpoint service for conversation/git state snapshots
+    const checkpointService = new CheckpointService({ projectPath: workingDir });
+
+    // Policy engine for tool execution decisions
+    const policyDir = path.join(workingDir, '.popilot', 'policies');
+    const policyEngine = new PolicyEngine({ policyDir, rememberDecisions: true });
+
     console.log(`📁 Debug logs: ${logger.getLogDir()}`);
 
     // Log transformer config if custom values are set
@@ -498,6 +510,8 @@ export function App({ model, workingDir, transformerConfig }: AppProps) {
       transformer,
       logger,
       fileUploader,
+      checkpointService,
+      policyEngine,
     };
 
     // Check authentication status on startup
@@ -1547,6 +1561,191 @@ ${archives.map(a => `- ${a}`).join('\n')}`,
             }]);
           }
         })();
+        break;
+      }
+
+      case 'restore':
+      case 'checkpoint': {
+        // /checkpoint - list checkpoints
+        // /checkpoint <id> - restore a checkpoint
+        // /checkpoint create [description] - create a checkpoint
+        // /checkpoint delete <id> - delete a checkpoint
+        const { checkpointService } = servicesRef.current!;
+        const subCmd = args[0];
+
+        if (!subCmd) {
+          // List checkpoints
+          (async () => {
+            try {
+              const checkpoints = await checkpointService.list();
+              if (checkpoints.length === 0) {
+                setMessages((prev) => [...prev, {
+                  role: 'assistant',
+                  content: `[SYSTEM] 저장된 체크포인트가 없습니다.
+
+체크포인트 사용법:
+  /checkpoint create [설명]  새 체크포인트 생성
+  /checkpoint <id>          체크포인트 복원
+  /checkpoint delete <id>   체크포인트 삭제`,
+                }]);
+              } else {
+                // Format checkpoint list with more details
+                const list = checkpoints.slice(0, 10).map((cp: { id: string; timestamp: string; description: string; toolCall?: string; hasGitPatch: boolean }, i: number) => {
+                  const time = new Date(cp.timestamp).toLocaleString('ko-KR', {
+                    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit'
+                  });
+                  const toolInfo = cp.toolCall ? ` [${cp.toolCall}]` : '';
+                  const gitBadge = cp.hasGitPatch ? ' 📁' : '';
+                  return `  ${i + 1}. [${cp.id.slice(0, 8)}] ${time}${gitBadge}${toolInfo}\n     ${cp.description}`;
+                }).join('\n');
+
+                setMessages((prev) => [...prev, {
+                  role: 'assistant',
+                  content: `[SYSTEM] 체크포인트 목록 (최근 10개)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+${list}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+📁 = Git 상태 포함
+
+명령어:
+  /checkpoint <id>          복원
+  /checkpoint create [설명] 생성
+  /checkpoint delete <id>   삭제`,
+                }]);
+              }
+            } catch (err) {
+              setError(err instanceof Error ? err.message : 'Failed to list checkpoints');
+            }
+          })();
+        } else if (subCmd === 'create') {
+          // Create a checkpoint
+          const description = args.slice(1).join(' ') || '수동 체크포인트';
+          (async () => {
+            try {
+              const id = await checkpointService.createCheckpoint(messages, undefined, description);
+              setMessages((prev) => [...prev, {
+                role: 'assistant',
+                content: `[SYSTEM] ✅ 체크포인트 생성됨
+ID: ${id.slice(0, 12)}
+설명: ${description}
+
+복원하려면: /checkpoint ${id.slice(0, 8)}`,
+              }]);
+            } catch (err) {
+              setError(err instanceof Error ? err.message : 'Failed to create checkpoint');
+            }
+          })();
+        } else if (subCmd === 'delete') {
+          // Delete a checkpoint
+          const targetId = args[1];
+          if (!targetId) {
+            setError('삭제할 체크포인트 ID를 지정하세요: /checkpoint delete <id>');
+            break;
+          }
+          (async () => {
+            try {
+              const checkpoints = await checkpointService.list();
+              const match = checkpoints.find((cp: { id: string }) => cp.id.startsWith(targetId));
+
+              if (!match) {
+                setError(`체크포인트를 찾을 수 없습니다: ${targetId}`);
+                return;
+              }
+
+              const deleted = await checkpointService.delete(match.id);
+              if (deleted) {
+                setMessages((prev) => [...prev, {
+                  role: 'assistant',
+                  content: `[SYSTEM] ✅ 체크포인트 삭제됨: ${match.id.slice(0, 12)}`,
+                }]);
+              } else {
+                setError('체크포인트 삭제 실패');
+              }
+            } catch (err) {
+              setError(err instanceof Error ? err.message : 'Failed to delete checkpoint');
+            }
+          })();
+        } else {
+          // Restore a checkpoint by ID (partial match)
+          (async () => {
+            try {
+              const checkpoints = await checkpointService.list();
+              const match = checkpoints.find((cp: { id: string }) => cp.id.startsWith(subCmd));
+
+              if (!match) {
+                setError(`체크포인트를 찾을 수 없습니다: ${subCmd}`);
+                return;
+              }
+
+              // Show confirmation before restore
+              const time = new Date(match.timestamp).toLocaleString('ko-KR');
+              setMessages((prev) => [...prev, {
+                role: 'assistant',
+                content: `[SYSTEM] 체크포인트 복원 중...
+ID: ${match.id.slice(0, 12)}
+생성일: ${time}
+설명: ${match.description}
+Git 상태: ${match.hasGitPatch ? '복원됨' : '없음'}`,
+              }]);
+
+              const result = await checkpointService.restore(match.id, { restoreGit: true });
+              if (result.success && result.checkpoint) {
+                const checkpoint = result.checkpoint;
+                setMessages(checkpoint.conversation);
+                const gitMsg = result.gitRestoreResult?.success ? ' (파일 상태 복원됨)' : '';
+                setMessages((prev) => [...prev, {
+                  role: 'assistant',
+                  content: `[SYSTEM] ✅ 체크포인트 복원 완료${gitMsg}
+
+대화가 체크포인트 시점으로 되돌아갔습니다.
+메시지 수: ${checkpoint.conversation.length}개`,
+                }]);
+              } else {
+                setError(result.message);
+              }
+            } catch (err) {
+              setError(err instanceof Error ? err.message : 'Failed to restore checkpoint');
+            }
+          })();
+        }
+        break;
+      }
+
+      case 'policy': {
+        // /policy - show current policy status
+        // /policy mode <default|autoEdit|yolo> - change policy mode
+        // /policy clear - clear saved decisions
+        const { policyEngine } = servicesRef.current!;
+        const subCmd = args[0];
+
+        if (!subCmd) {
+          // Show policy status
+          const status = policyEngine.formatStatus();
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: `[SYSTEM] 정책 상태:\n${status}\n\n사용법:\n  /policy mode <default|autoEdit|yolo>\n  /policy clear`,
+          }]);
+        } else if (subCmd === 'mode' && args[1]) {
+          const modeInput = args[1].toLowerCase();
+          if (modeInput === 'default' || modeInput === 'autoedit' || modeInput === 'yolo') {
+            const normalizedMode: ApprovalMode = modeInput === 'autoedit' ? 'autoEdit' : (modeInput as ApprovalMode);
+            policyEngine.setMode(normalizedMode);
+            setMessages((prev) => [...prev, {
+              role: 'assistant',
+              content: `[SYSTEM] 정책 모드 변경: ${normalizedMode}${normalizedMode === 'yolo' ? ' ⚠️ 모든 도구 자동 승인!' : ''}`,
+            }]);
+          } else {
+            setError('사용 가능한 모드: default, autoEdit, yolo');
+          }
+        } else if (subCmd === 'clear') {
+          policyEngine.clearSavedDecisions();
+          setMessages((prev) => [...prev, {
+            role: 'assistant',
+            content: '[SYSTEM] 저장된 정책 결정이 초기화되었습니다.',
+          }]);
+        } else {
+          setError('사용법: /policy, /policy mode <mode>, /policy clear');
+        }
         break;
       }
 

@@ -55,6 +55,35 @@ export { ToolParser, type ParsedToolBlock } from './tools/tool-parser.js';
 
 // Services
 export { SessionService, type SessionServiceConfig } from './services/session-service.js';
+export {
+  CheckpointService,
+  type CheckpointServiceConfig,
+  type Checkpoint,
+  type CheckpointListItem,
+} from './services/checkpoint-service.js';
+
+// Policy
+export {
+  PolicyEngine,
+  createDefaultPolicyEngine,
+  type PolicyDecision,
+  type ApprovalMode,
+  type PolicyRule,
+  type PolicyConfig,
+  type SavedDecision,
+} from './policy/policy-engine.js';
+
+// Svelte Validation
+export {
+  validateSvelteFile,
+  validateSvelteFileAsync,
+  quickSvelteCheck,
+  formatValidationErrors,
+  type SvelteValidationResult,
+  type SvelteValidationError,
+  type SvelteValidationWarning,
+  type SvelteMetadata,
+} from './tools/svelte-validator.js';
 
 // Utils
 export { DebugLogger } from './utils/logger.js';

@@ -12,6 +12,7 @@ import { spawn, execSync } from 'node:child_process';
 import type { ToolDefinition, ToolResult, FileAttachment } from '../types.js';
 import { getMimeType } from '../client/file-uploader.js';
 import { readManyFiles, formatReadManyFilesResult, type ReadManyFilesArgs } from './read-many-files.js';
+import { quickSvelteCheck } from './svelte-validator.js';
 
 // Threshold for file attachment (chars) - files larger than this get uploaded
 const FILE_ATTACHMENT_THRESHOLD = 2000;
@@ -69,6 +70,7 @@ export class ToolExecutor {
     // Verification tools
     'run_lint',
     'run_typecheck',
+    'run_svelte_check',
   ]);
 
   constructor(config: ToolExecutorConfig) {
@@ -228,6 +230,9 @@ export class ToolExecutor {
           break;
         case 'run_typecheck':
           result = await this.execRunTypecheck(args);
+          break;
+        case 'run_svelte_check':
+          result = await this.execRunSvelteCheck(args);
           break;
         default:
           result = `[Error] Unknown tool: ${toolName}`;
@@ -994,6 +999,18 @@ edit_file requires the COMPLETE file content. Please:
   private validateSyntax(content: string, filepath: string): string[] {
     const warnings: string[] = [];
     const ext = path.extname(filepath).toLowerCase();
+
+    // Svelte files: use dedicated Svelte compiler for validation
+    if (ext === '.svelte') {
+      try {
+        const svelteErrors = quickSvelteCheck(content, filepath);
+        return svelteErrors;
+      } catch (error) {
+        // If Svelte compiler fails to load, fall back to basic bracket checking
+        console.warn('[validateSyntax] Svelte validator not available, using basic check');
+        // Continue to basic validation below
+      }
+    }
 
     // Only validate code files
     const codeExtensions = ['.ts', '.tsx', '.js', '.jsx', '.json', '.py', '.java', '.c', '.cpp', '.h', '.go', '.rs'];
@@ -1955,6 +1972,121 @@ Config: ${tsconfigPath}`;
         }
       }
       return `[Error] Type check failed: ${errorMsg}`;
+    }
+  }
+
+  /**
+   * Execute Svelte type checking (svelte-check).
+   * Checks Svelte components for type errors and accessibility issues.
+   */
+  private async execRunSvelteCheck(args: Record<string, unknown>): Promise<string> {
+    const tsconfig = args.tsconfig as string | undefined;
+    const paths = args.paths as string[] | undefined;
+
+    // Find svelte.config.js or tsconfig.json
+    const tsconfigPath = tsconfig
+      ? this.resolvePath(tsconfig)
+      : path.join(this.workspaceDir, 'tsconfig.json');
+
+    // Build command
+    let command = 'npx svelte-check';
+
+    if (fs.existsSync(tsconfigPath)) {
+      command += ` --tsconfig ${tsconfigPath}`;
+    }
+
+    // Add specific file paths if provided
+    if (paths && paths.length > 0) {
+      // svelte-check doesn't support specific files directly,
+      // but we can filter output for these files
+      command += ' --output human';
+    } else {
+      command += ' --output human';
+    }
+
+    try {
+      const { stdout, stderr } = await this.runCommandWithOutput(command);
+      const output = (stdout + '\n' + stderr).trim();
+
+      // Filter output for specific paths if provided
+      let filteredOutput = output;
+      if (paths && paths.length > 0) {
+        const lines = output.split('\n');
+        const filtered: string[] = [];
+        let includeNext = false;
+
+        for (const line of lines) {
+          // Check if this line mentions one of our target files
+          const matchesPath = paths.some(p => line.includes(path.basename(p)) || line.includes(p));
+          if (matchesPath) {
+            includeNext = true;
+          }
+          if (includeNext) {
+            filtered.push(line);
+            // Error blocks typically end with empty line
+            if (line.trim() === '' && filtered.length > 1) {
+              includeNext = false;
+            }
+          }
+        }
+
+        // Keep summary lines
+        const summaryLines = lines.filter(l =>
+          l.includes('Error') || l.includes('Warning') || l.includes('completed')
+        );
+        filteredOutput = [...filtered, ...summaryLines].join('\n');
+      }
+
+      // Parse results
+      const errorMatches = output.match(/Error:/gi) || [];
+      const warningMatches = output.match(/Warning:/gi) || [];
+      const errorCount = errorMatches.length;
+      const warningCount = warningMatches.length;
+
+      if (errorCount === 0 && warningCount === 0) {
+        return `[run_svelte_check] ✅ Svelte: No errors found!
+
+Config: ${tsconfigPath}
+${paths ? `Checked: ${paths.join(', ')}` : 'Checked: All .svelte files'}`;
+      }
+
+      let result = `[run_svelte_check] Svelte Check Results:\n`;
+      result += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+      result += filteredOutput || output;
+      result += '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+      result += `Summary: ${errorCount} error(s), ${warningCount} warning(s)`;
+
+      return result;
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+
+      // svelte-check returns non-zero when errors are found
+      if (errorMsg.includes('Command failed')) {
+        const output = (error as { stdout?: string; stderr?: string }).stdout ||
+                       (error as { stdout?: string; stderr?: string }).stderr || '';
+        if (output) {
+          const errorMatches = output.match(/Error:/gi) || [];
+          const warningMatches = output.match(/Warning:/gi) || [];
+
+          let result = `[run_svelte_check] Svelte Check found ${errorMatches.length} error(s):\n`;
+          result += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+          result += output;
+          return result;
+        }
+      }
+
+      // Check if svelte-check is not installed
+      if (errorMsg.includes('not found') || errorMsg.includes('ENOENT')) {
+        return `[Error] svelte-check not found.
+
+To install:
+  npm install -D svelte-check typescript
+
+Or with pnpm:
+  pnpm add -D svelte-check typescript`;
+      }
+
+      return `[Error] Svelte check failed: ${errorMsg}`;
     }
   }
 
