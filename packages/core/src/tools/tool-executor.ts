@@ -40,6 +40,11 @@ export class ToolExecutor {
   private workspaceDir: string;
   private timeout: number;
 
+  // 재시도 횟수 제한 - 같은 작업 반복 방지
+  private recentToolCalls: Map<string, { count: number; lastArgs: string; timestamp: number }> = new Map();
+  private readonly MAX_RETRIES = 3;
+  private readonly CALL_TRACKING_WINDOW_MS = 60000; // 1분 내 동일 작업 추적
+
   // Tools that we handle directly
   static readonly SUPPORTED_TOOLS = new Set([
     'file.read',
@@ -59,6 +64,9 @@ export class ToolExecutor {
     'git.log',
     'git.restore',
     'git.show',
+    // Verification tools
+    'run_lint',
+    'run_typecheck',
   ]);
 
   constructor(config: ToolExecutorConfig) {
@@ -74,10 +82,87 @@ export class ToolExecutor {
   }
 
   /**
+   * Generate a key for tracking similar tool calls.
+   * For file operations, key includes filepath; for others, uses args summary.
+   */
+  private generateCallKey(toolName: string, args: Record<string, unknown>): string {
+    // For file operations, track by tool + filepath
+    const filepath = args.filepath ?? args.path ?? '';
+    if (filepath && typeof filepath === 'string') {
+      return `${toolName}:${filepath}`;
+    }
+    // For other tools, use first 150 chars of stringified args
+    return `${toolName}:${JSON.stringify(args).slice(0, 150)}`;
+  }
+
+  /**
+   * Check if this tool call is being repeated too many times.
+   * Returns error message if limit exceeded, null otherwise.
+   */
+  private checkRetryLimit(toolName: string, args: Record<string, unknown>): string | null {
+    const now = Date.now();
+    const callKey = this.generateCallKey(toolName, args);
+
+    // Clean up old entries
+    for (const [key, value] of this.recentToolCalls.entries()) {
+      if (now - value.timestamp > this.CALL_TRACKING_WINDOW_MS) {
+        this.recentToolCalls.delete(key);
+      }
+    }
+
+    // Check current call
+    const recent = this.recentToolCalls.get(callKey);
+    if (recent && recent.count >= this.MAX_RETRIES) {
+      return `[ERROR] 같은 작업을 ${this.MAX_RETRIES}회 반복 시도했습니다.
+
+도구: ${toolName}
+대상: ${args.filepath ?? args.path ?? '(unknown)'}
+
+이 작업이 계속 실패하는 이유를 분석하고 다른 방법을 시도하세요:
+1. 파일을 다시 읽어 현재 상태 확인
+2. 에러 메시지를 주의 깊게 분석
+3. 다른 접근 방법 고려
+
+[!] 새로운 접근 방법을 시도하면 카운터가 리셋됩니다.`;
+    }
+
+    // Update counter
+    this.recentToolCalls.set(callKey, {
+      count: (recent?.count ?? 0) + 1,
+      lastArgs: JSON.stringify(args).slice(0, 500),
+      timestamp: now,
+    });
+
+    return null;
+  }
+
+  /**
+   * Reset retry counter for a specific tool call (call after success).
+   */
+  private resetRetryCounter(toolName: string, args: Record<string, unknown>): void {
+    const callKey = this.generateCallKey(toolName, args);
+    this.recentToolCalls.delete(callKey);
+  }
+
+  /**
    * Execute a tool and return result.
    */
   async execute(toolName: string, args: Record<string, unknown>): Promise<ToolResult> {
     const callId = crypto.randomUUID();
+
+    // 재시도 제한 체크 (file.applyTextEdits, edit_file 등 수정 도구에 적용)
+    const modifyingTools = ['file.applyTextEdits', 'edit_file', 'create_new_file'];
+    if (modifyingTools.includes(toolName)) {
+      const retryError = this.checkRetryLimit(toolName, args);
+      if (retryError) {
+        return {
+          callId,
+          name: toolName,
+          result: retryError,
+          success: false,
+        };
+      }
+    }
 
     try {
       let result: string;
@@ -132,15 +217,29 @@ export class ToolExecutor {
         case 'git.show':
           result = await this.execGitShow(args);
           break;
+        // Verification tools
+        case 'run_lint':
+          result = await this.execRunLint(args);
+          break;
+        case 'run_typecheck':
+          result = await this.execRunTypecheck(args);
+          break;
         default:
           result = `[Error] Unknown tool: ${toolName}`;
+      }
+
+      const success = !result.startsWith('[Error]') && !result.startsWith('[ERROR]');
+
+      // 성공 시 재시도 카운터 리셋
+      if (success && modifyingTools.includes(toolName)) {
+        this.resetRetryCounter(toolName, args);
       }
 
       return {
         callId,
         name: toolName,
         result,
-        success: !result.startsWith('[Error]'),
+        success,
         fileAttachment,
       };
     } catch (error) {
@@ -998,7 +1097,32 @@ edit_file requires the COMPLETE file content. Please:
       try {
         edits = JSON.parse(editsStr);
       } catch (e) {
-        return `[Error] Invalid edits JSON: ${e instanceof Error ? e.message : String(e)}\nReceived: ${editsStr.slice(0, 200)}`;
+        // JSON 파싱 오류 시 더 명확한 안내 제공
+        const errMsg = e instanceof Error ? e.message : String(e);
+        return `[ERROR] JSON 형식 오류
+
+문제: ${errMsg}
+
+받은 값 (처음 200자):
+${editsStr.slice(0, 200)}
+
+올바른 형식 예시:
+{
+  "filepath": "path/to/file.ts",
+  "expectedSha256": "abc123...",
+  "edits": [
+    {
+      "startLine": 10,      // 숫자로 입력! (따옴표 없이)
+      "endLine": 15,        // 숫자로 입력! (따옴표 없이)
+      "newText": "새 코드"  // 문자열로 입력
+    }
+  ]
+}
+
+주의:
+- (라인번호) 같은 플레이스홀더 사용 금지!
+- startLine, endLine은 반드시 숫자 타입
+- 줄 번호는 1부터 시작 (0이 아님)`;
       }
     }
 
@@ -1026,6 +1150,27 @@ edit_file requires the COMPLETE file content. Please:
 
       if (expectedSha && currentSha !== expectedSha) {
         return `[Error] SHA256 mismatch! Expected: ${expectedSha.slice(0, 16)}..., Got: ${currentSha.slice(0, 16)}...\nFile was modified. Please re-read and retry.`;
+      }
+
+      // 중복 콘텐츠 감지 - 같은 내용 반복 추가 방지
+      for (const edit of edits) {
+        if (edit.newText && edit.newText.length > 50) {
+          // 추가하려는 내용의 첫 200자를 정규화하여 비교
+          const newTextSample = edit.newText.trim().slice(0, 200);
+          if (content.includes(newTextSample)) {
+            return `[WARNING] 추가하려는 내용이 이미 파일에 존재합니다!
+
+파일: ${filepath}
+감지된 중복: "${newTextSample.slice(0, 80)}..."
+
+현재 파일을 다시 읽어서 상태를 확인하세요:
+1. file.read 도구로 파일 다시 읽기
+2. 이미 추가된 내용인지 확인
+3. 필요한 경우에만 수정 진행
+
+[!] 중복 추가를 방지하기 위해 편집이 취소되었습니다.`;
+          }
+        }
       }
 
       const lines = content.split('\n');
@@ -1431,6 +1576,236 @@ edit_file requires the COMPLETE file content. Please:
     return result;
   }
 
+  // ========================================
+  // Verification Tools (Lint/Typecheck)
+  // ========================================
+
+  /**
+   * Execute ESLint for code quality checking.
+   * Supports TypeScript, JavaScript, React files.
+   */
+  private async execRunLint(args: Record<string, unknown>): Promise<string> {
+    // Optional: specific files/directories to lint
+    const paths = args.paths as string[] | undefined;
+    const fix = args.fix as boolean | undefined;
+
+    // Detect project type and available linting tools
+    const hasEslintConfig = this.fileExists('.eslintrc.js') ||
+                            this.fileExists('.eslintrc.json') ||
+                            this.fileExists('.eslintrc.yml') ||
+                            this.fileExists('eslint.config.js') ||
+                            this.fileExists('eslint.config.mjs');
+
+    const hasBiomeConfig = this.fileExists('biome.json') ||
+                           this.fileExists('biome.jsonc');
+
+    let command: string;
+    let linter: string;
+
+    if (hasEslintConfig) {
+      linter = 'ESLint';
+      const eslintArgs = ['eslint'];
+      if (paths && paths.length > 0) {
+        eslintArgs.push(...paths.map(p => this.resolvePath(p)));
+      } else {
+        eslintArgs.push('.');
+      }
+      eslintArgs.push('--ext', '.ts,.tsx,.js,.jsx');
+      eslintArgs.push('--format', 'stylish');
+      if (fix) {
+        eslintArgs.push('--fix');
+      }
+      // Don't fail on lint errors, just report them
+      eslintArgs.push('--max-warnings', '9999');
+      command = `npx ${eslintArgs.join(' ')}`;
+    } else if (hasBiomeConfig) {
+      linter = 'Biome';
+      const biomeArgs = ['biome', 'lint'];
+      if (paths && paths.length > 0) {
+        biomeArgs.push(...paths.map(p => this.resolvePath(p)));
+      } else {
+        biomeArgs.push('.');
+      }
+      if (fix) {
+        biomeArgs.push('--apply');
+      }
+      command = `npx ${biomeArgs.join(' ')}`;
+    } else {
+      return `[Error] No linter configuration found.
+
+Please ensure you have one of the following:
+- ESLint: .eslintrc.js, .eslintrc.json, eslint.config.js
+- Biome: biome.json
+
+To set up ESLint:
+  npx eslint --init
+
+To set up Biome:
+  npx @biomejs/biome init`;
+    }
+
+    try {
+      const { stdout, stderr } = await this.runCommandWithOutput(command);
+      const output = (stdout + '\n' + stderr).trim();
+
+      if (!output || output.length < 10) {
+        return `[run_lint] ✅ ${linter}: No issues found!
+
+Checked: ${paths?.join(', ') || 'entire project'}`;
+      }
+
+      // Parse output to count errors/warnings
+      const errorCount = (output.match(/\d+ errors?/gi) || []).length > 0
+        ? output.match(/(\d+) errors?/i)?.[1] || '0'
+        : '0';
+      const warningCount = (output.match(/\d+ warnings?/gi) || []).length > 0
+        ? output.match(/(\d+) warnings?/i)?.[1] || '0'
+        : '0';
+
+      let result = `[run_lint] ${linter} Results:\n`;
+      result += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+      result += output;
+      result += '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+      result += `Summary: ${errorCount} error(s), ${warningCount} warning(s)`;
+
+      if (fix) {
+        result += '\n[!] Auto-fix was applied. Review changes with git.diff';
+      }
+
+      return result;
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      // Lint errors are often returned as non-zero exit, but output is still useful
+      if (errorMsg.includes('Command failed')) {
+        const output = (error as { stdout?: string; stderr?: string }).stdout ||
+                       (error as { stdout?: string; stderr?: string }).stderr || '';
+        if (output) {
+          let result = `[run_lint] ${linter} found issues:\n`;
+          result += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+          result += output;
+          return result;
+        }
+      }
+      return `[Error] Lint failed: ${errorMsg}`;
+    }
+  }
+
+  /**
+   * Execute TypeScript type checking (tsc --noEmit).
+   */
+  private async execRunTypecheck(args: Record<string, unknown>): Promise<string> {
+    const projectRoot = args.projectRoot as string | undefined;
+
+    // Find tsconfig.json
+    const tsconfigPath = projectRoot
+      ? path.join(this.resolvePath(projectRoot), 'tsconfig.json')
+      : path.join(this.workspaceDir, 'tsconfig.json');
+
+    if (!fs.existsSync(tsconfigPath)) {
+      return `[Error] tsconfig.json not found at: ${tsconfigPath}
+
+Please ensure:
+1. You have a tsconfig.json in your project root
+2. Or specify projectRoot parameter pointing to the directory with tsconfig.json`;
+    }
+
+    const tscArgs = ['tsc', '--noEmit'];
+    if (projectRoot) {
+      tscArgs.push('--project', this.resolvePath(projectRoot));
+    }
+
+    const command = `npx ${tscArgs.join(' ')}`;
+
+    try {
+      const { stdout, stderr } = await this.runCommandWithOutput(command);
+      const output = (stdout + '\n' + stderr).trim();
+
+      if (!output || output.length < 10) {
+        return `[run_typecheck] ✅ TypeScript: No type errors found!
+
+Config: ${tsconfigPath}`;
+      }
+
+      // Parse TypeScript errors
+      const errorMatches = output.match(/error TS\d+:/gi) || [];
+      const errorCount = errorMatches.length;
+
+      let result = `[run_typecheck] TypeScript Results:\n`;
+      result += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+      result += output;
+      result += '\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+      result += `Summary: ${errorCount} type error(s)`;
+
+      return result;
+    } catch (error) {
+      const errorMsg = error instanceof Error ? error.message : String(error);
+      // Type errors cause non-zero exit, but output is still useful
+      if (errorMsg.includes('Command failed')) {
+        const output = (error as { stdout?: string; stderr?: string }).stdout ||
+                       (error as { stdout?: string; stderr?: string }).stderr || '';
+        if (output) {
+          // Parse error count
+          const errorMatches = output.match(/error TS\d+:/gi) || [];
+          const errorCount = errorMatches.length;
+
+          let result = `[run_typecheck] TypeScript found ${errorCount} type error(s):\n`;
+          result += '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n';
+          result += output;
+          return result;
+        }
+      }
+      return `[Error] Type check failed: ${errorMsg}`;
+    }
+  }
+
+  /**
+   * Helper: Check if a file exists in workspace.
+   */
+  private fileExists(relativePath: string): boolean {
+    return fs.existsSync(path.join(this.workspaceDir, relativePath));
+  }
+
+  /**
+   * Helper: Run command and capture stdout/stderr.
+   */
+  private async runCommandWithOutput(command: string): Promise<{ stdout: string; stderr: string }> {
+    return new Promise((resolve, reject) => {
+      const proc = spawn('sh', ['-c', command], {
+        cwd: this.workspaceDir,
+        timeout: this.timeout,
+        env: { ...process.env, FORCE_COLOR: '0' },
+      });
+
+      let stdout = '';
+      let stderr = '';
+
+      proc.stdout?.on('data', (data) => {
+        stdout += data.toString();
+      });
+
+      proc.stderr?.on('data', (data) => {
+        stderr += data.toString();
+      });
+
+      proc.on('close', (code) => {
+        if (code === 0) {
+          resolve({ stdout, stderr });
+        } else {
+          // Still resolve with output for lint/typecheck tools
+          // They return non-zero when issues are found
+          const error = new Error(`Command failed with code ${code}`) as Error & { stdout: string; stderr: string };
+          error.stdout = stdout;
+          error.stderr = stderr;
+          reject(error);
+        }
+      });
+
+      proc.on('error', (err) => {
+        reject(err);
+      });
+    });
+  }
+
   /**
    * Get tool definitions for all supported tools.
    */
@@ -1556,6 +1931,38 @@ edit_file requires the COMPLETE file content. Please:
         },
         requiresConfirmation: true,
         riskLevel: 'medium',
+      },
+      // Verification tools
+      {
+        name: 'run_lint',
+        description: 'Run ESLint or Biome to check code quality. Supports TypeScript, JavaScript, React files.',
+        parameters: {
+          paths: {
+            type: 'array',
+            description: 'Optional: specific files or directories to lint (default: entire project)',
+            required: false,
+          },
+          fix: {
+            type: 'boolean',
+            description: 'Whether to auto-fix issues (default: false)',
+            required: false,
+          },
+        },
+        requiresConfirmation: false,
+        riskLevel: 'low',
+      },
+      {
+        name: 'run_typecheck',
+        description: 'Run TypeScript type checking (tsc --noEmit) to find type errors.',
+        parameters: {
+          projectRoot: {
+            type: 'string',
+            description: 'Optional: directory containing tsconfig.json (default: workspace root)',
+            required: false,
+          },
+        },
+        requiresConfirmation: false,
+        riskLevel: 'low',
       },
     ];
   }
