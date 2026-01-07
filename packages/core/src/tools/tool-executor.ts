@@ -11,6 +11,7 @@ import * as crypto from 'node:crypto';
 import { spawn, execSync } from 'node:child_process';
 import type { ToolDefinition, ToolResult, FileAttachment } from '../types.js';
 import { getMimeType } from '../client/file-uploader.js';
+import { readManyFiles, formatReadManyFilesResult, type ReadManyFilesArgs } from './read-many-files.js';
 
 // Threshold for file attachment (chars) - files larger than this get uploaded
 const FILE_ATTACHMENT_THRESHOLD = 2000;
@@ -55,6 +56,7 @@ export class ToolExecutor {
     'create_new_file',
     'edit_file',
     'read_file',
+    'read_many_files',  // Multi-file reading (gemini-cli style)
     'run_terminal_command',
     'list_directory',
     'tree',
@@ -197,6 +199,9 @@ export class ToolExecutor {
         case 'file.find':
         case 'find_files':
           result = this.execFindFiles(args);
+          break;
+        case 'read_many_files':
+          result = await this.execReadManyFiles(args);
           break;
         case 'file.applyTextEdits':
           result = await this.execApplyEdits(args);
@@ -698,6 +703,48 @@ Tips:
         return `[Error] Directory not found: ${dirpath}`;
       }
       return `[Error] Find failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+  }
+
+  /**
+   * Read multiple files matching glob patterns (gemini-cli style).
+   * Efficient for codebase exploration - reads up to 10 files at once.
+   */
+  private async execReadManyFiles(args: Record<string, unknown>): Promise<string> {
+    const include = args.include as string[] | undefined;
+
+    if (!include || !Array.isArray(include) || include.length === 0) {
+      return `[Error] include is required and must be an array of glob patterns.
+
+Examples:
+- include: ["src/**/*.tsx"] → all TSX files in src
+- include: ["*.json", "*.md"] → JSON and markdown in root
+- include: ["src/components/**/*.ts", "src/hooks/**/*.ts"] → specific directories
+
+Usage:
+[CODE]tool
+TOOL_NAME: read_many_files
+BEGIN_ARG: include
+["src/**/*.tsx", "src/**/*.ts"]
+END_ARG
+BEGIN_ARG: maxFiles
+10
+END_ARG
+[CODE]`;
+    }
+
+    const readManyArgs: ReadManyFilesArgs = {
+      include,
+      exclude: args.exclude as string[] | undefined,
+      maxFiles: args.maxFiles as number | undefined,
+      maxTotalChars: args.maxTotalChars as number | undefined,
+    };
+
+    try {
+      const result = await readManyFiles(this.workspaceDir, readManyArgs);
+      return formatReadManyFilesResult(result);
+    } catch (error) {
+      return `[Error] read_many_files failed: ${error instanceof Error ? error.message : String(error)}`;
     }
   }
 
@@ -1867,6 +1914,34 @@ Config: ${tsconfigPath}`;
           maxResults: {
             type: 'number',
             description: 'Maximum number of results (default: 20, max: 50)',
+            required: false,
+          },
+        },
+        requiresConfirmation: false,
+        riskLevel: 'low',
+      },
+      {
+        name: 'read_many_files',
+        description: 'Read multiple files matching glob patterns in a single call. Efficient for codebase exploration.',
+        parameters: {
+          include: {
+            type: 'array',
+            description: 'Array of glob patterns to include (e.g., ["src/**/*.ts", "*.json"])',
+            required: true,
+          },
+          exclude: {
+            type: 'array',
+            description: 'Array of glob patterns to exclude (default: node_modules, .git, etc.)',
+            required: false,
+          },
+          maxFiles: {
+            type: 'number',
+            description: 'Maximum files to read (default: 10, max: 20)',
+            required: false,
+          },
+          maxTotalChars: {
+            type: 'number',
+            description: 'Maximum total characters (default: 100000)',
             required: false,
           },
         },

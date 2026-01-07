@@ -142,6 +142,29 @@ END_ARG
     - "idx" → index.ts, index.tsx
     [!] No need for exact glob patterns - just type key characters!
 
+10. read_many_files - ⭐ Read multiple files at once (for codebase exploration)
+    Args: include (required array), exclude (optional array), maxFiles (default: 10)
+    [!] Use this when exploring a codebase - reads up to 10 files in one call!
+
+    Example: Read all TypeScript files in src
+    [CODE]tool
+    TOOL_NAME: read_many_files
+    BEGIN_ARG: include
+    ["src/**/*.ts", "src/**/*.tsx"]
+    END_ARG
+    BEGIN_ARG: exclude
+    ["**/*.test.ts", "**/*.spec.ts"]
+    END_ARG
+    BEGIN_ARG: maxFiles
+    10
+    END_ARG
+    [CODE]
+
+    [!] Efficient patterns:
+    - ["src/**/*.tsx"] → all React components in src
+    - ["*.json", "*.md"] → config and docs in root
+    - ["packages/*/src/index.ts"] → all package entry points
+
 # [!!!] FILE MODIFICATION - USE file.applyTextEdits! [!!!]
 
 ## ⭐ RECOMMENDED: Atomic Line Edits (file.applyTextEdits)
